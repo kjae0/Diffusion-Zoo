@@ -71,12 +71,11 @@ class ResnetBlock(nn.Module):
     def forward(self, x, time_emb = None):
         scale_shift = None
         
-        if self.mlp and time_emb:
-            time_emb = self.mlp(time_emb).unsqueeze(0).unsqueeze(0)
-            scale_shift = time_emb.chunk(2, dim = 1)
+        if self.mlp:
+            assert time_emb is not None, 'time embedding must be given'
             
-        elif self.mlp or time_emb:
-            raise ValueError('time_emb and mlp must be given together')
+            time_emb = self.mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
+            scale_shift = time_emb.chunk(2, dim = 1) 
 
         h = self.block1(x, scale_shift=scale_shift)
         h = self.block2(h)

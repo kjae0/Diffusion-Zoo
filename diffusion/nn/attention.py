@@ -1,4 +1,4 @@
-from norms import RMSNorm
+from diffusion.nn.norms import RMSNorm
 
 from einops import rearrange, repeat
 from functools import partial
