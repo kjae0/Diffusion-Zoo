@@ -1,0 +1,4 @@
+1. data validation
+2. model setting
+3. training code
+4. detail nn implementation

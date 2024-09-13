@@ -1,0 +1,13 @@
+*.png
+*.jpg
+*.pt
+*.pth
+*.out
+*.ipynb
+*.pz
+*.pkl
+*.zip
+
+/data/*
+/ckpts/*
+/__pycache__/*
