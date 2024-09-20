@@ -1,43 +1,72 @@
+import math
 import torch
 import torch.nn as nn
 
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
-# PRUNING!!
+#  def predict_start_from_noise(self, x_t, t, noise):
+#         return (
+#             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+#             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+#         )
 
-def exists(x):
-    return x is not None
+def ema(source, target, decay):
+    source_dict = source.state_dict()
+    target_dict = target.state_dict()
+    for key in source_dict.keys():
+        target_dict[key].data.copy_(
+            target_dict[key].data * decay +
+            source_dict[key].data * (1 - decay))
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if callable(d) else d
+def x0_to_noise(x0, xt, sqrt_alpha_cumprod, sqrt_one_minus_alpha_cumprod):
+    return (xt - shape_matcher_1d(sqrt_alpha_cumprod, x0.shape) * x0) / \
+        shape_matcher_1d(sqrt_one_minus_alpha_cumprod, x0.shape)
 
-def cast_tuple(t, length = 1):
-    if isinstance(t, tuple):
-        return t
-    return ((t,) * length)
+def noise_to_x0(noise, xt, sqrt_alpha_cumprod, sqrt_one_minus_alpha_cumprod):
+    return (xt - shape_matcher_1d(sqrt_one_minus_alpha_cumprod, noise.shape) * noise) / \
+        shape_matcher_1d(sqrt_alpha_cumprod, noise.shape)
 
-def divisible_by(numer, denom):
-    return (numer % denom) == 0
+def velocity_to_x0(velocity, xt, sqrt_alpha_cumprod, sqrt_one_minus_alpha_cumprod):
+    return shape_matcher_1d(sqrt_alpha_cumprod, xt.shape) * xt - \
+        shape_matcher_1d(sqrt_one_minus_alpha_cumprod, velocity.shape) * velocity
 
-def identity(t, *args, **kwargs):
-    return t
+def shape_matcher_1d(x:torch.Tensor, shape):
+    return x.view(-1, *((1,) * (len(shape)-1)))
 
-def cycle(dl):
-    while True:
-        for data in dl:
-            yield data
+def get_learning_rate(optimizer):
+    # PyTorch optimizers can have multiple parameter groups, each with its own learning rate.
+    # Here, we retrieve the learning rate of the first parameter group.
+    for param_group in optimizer.param_groups:
+        return param_group['lr']
+    
+def save_checkpoints(ckpt_path, ckpt, epoch, train_loss, val_loss=None):
+    torch.save({
+        'epoch': epoch,
+        'checkpoint': ckpt,
+        'train_loss': train_loss,
+        'val_loss': val_loss
+    }, ckpt_path)
 
-def has_int_squareroot(num):
-    return (math.sqrt(num) ** 2) == num
-
+def build_loss_fn(cfg):
+    if cfg['name'] == 'l2':
+        return nn.MSELoss()
+    else:
+        raise NotImplementedError(f"Loss function {cfg['loss_fn']} not implemented")
+    
+def build_optimizer(cfg, params):
+    if cfg['name'] == 'adam':
+        return torch.optim.Adam(params, **cfg['optimizer_params'])
+    else:
+        raise NotImplementedError(f"Optimizer {cfg['optimizer']} not implemented")
+    
+def build_scheduler(cfg, optimizer):
+    if cfg['name'] == 'none':
+        return None
+    elif cfg['name'] == 'step':
+        return torch.optim.lr_scheduler.StepLR(optimizer, **cfg['scheduler_params'])
+    elif cfg['name'] == 'multisteplr':
+        return torch.optim.lr_scheduler.MultiStepLR(optimizer, **cfg['scheduler_params'])
+    else:
+        raise NotImplementedError(f"Scheduler {cfg['name']} not implemented")
+    
 def num_to_groups(num, divisor):
     groups = num // divisor
     remainder = num % divisor
@@ -51,24 +80,71 @@ def convert_image_to_fn(img_type, image):
         return image.convert(img_type)
     return image
 
-# normalization functions
+def get_beta_scheduler(sche_name):
+    if sche_name == 'linear':
+        return linear_beta_schedule
+    if sche_name == 'cosine':
+        return cosine_beta_schedule
+    if sche_name == 'sigmoid':
+        return sigmoid_beta_schedule
+    raise ValueError(f'unknown beta schedule {sche_name}')
 
-def normalize_to_neg_one_to_one(img):
-    return img * 2 - 1
+def linear_beta_schedule(timesteps):
+    """
+    linear schedule, proposed in original ddpm paper
+    """
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
-def unnormalize_to_zero_to_one(t):
-    return (t + 1) * 0.5
+def cosine_beta_schedule(timesteps, s = 0.008):
+    """
+    cosine schedule
+    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
+    alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
 
-# small helper modules
+def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
+    """
+    sigmoid schedule
+    proposed in https://arxiv.org/abs/2212.11972 - Figure 8
+    better for images > 64x64, when used during training
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
+    v_start = torch.tensor(start / tau).sigmoid()
+    v_end = torch.tensor(end / tau).sigmoid()
+    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
 
-def Upsample(dim, dim_out = None):
-    return nn.Sequential(
-        nn.Upsample(scale_factor = 2, mode = 'nearest'),
-        nn.Conv2d(dim, default(dim_out, dim), 3, padding = 1)
-    )
 
-def Downsample(dim, dim_out = None):
-    return nn.Sequential(
-        Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = 2, p2 = 2),
-        nn.Conv2d(dim * 4, default(dim_out, dim), 1)
-    )
+class Scaler:
+    def __init__(self, range):
+        self.range = range
+        
+    def normalize(self, x: torch.Tensor):
+        # x -> B x C x H x W range 0 to 1
+        return x * (self.range[1] - self.range[0]) + self.range[0]
+    
+    def unnormalize(self, x: torch.Tensor):
+        # x -> B x C x H x W range range[0] to range[1]
+        return (x - self.range[0]) / (self.range[1] - self.range[0])
+    
+class IdentityScaler:
+    def __init__(self):
+        pass
+    
+    def normalize(self, x: torch.Tensor):
+        return x
+    
+    def unnormalize(self, x: torch.Tensor):
+        return x
+

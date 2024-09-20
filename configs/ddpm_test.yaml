@@ -1,0 +1,78 @@
+# config.yaml
+time_emb: ''
+timesteps: 1000
+device: 'cuda'  # 'cuda' for GPU, 'cpu' for CPU
+verbose: True
+offset_noise_strength: 0.0
+image_size: [3, 32, 32]
+self_condition: True
+min_snr_loss_weight: False
+input_range: [0, 1]
+prediction_type: 'noise'
+clip_grad_norm: 1.0
+
+dataset:
+  root_dir: '/home/diya/Public/Image2Smiles/jy/Diffusion-Zoo/data/cifar10'
+  transform: 'default'
+
+# Model configuration
+model: 
+  name: 'unet'
+  model_params:
+    in_dim: 3
+    out_dim: 3
+    init_dim: 64
+    default_dim: 3
+    time_emb_dim: 128
+    attn_heads: 8
+    attn_head_dim: 64
+  time_emb:
+    name: 'sine'
+    time_emb_params:
+      in_dim: 32
+      hidden_dim_factor: 4
+      sinusoidal_pos_emb_theta: 10000
+
+
+# Loss function configuration
+loss:
+  name: 'l2'
+
+# Optimizer configuration
+optimizer:
+  name: 'adam'
+  optimizer_params:
+    lr: 0.0002
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+
+# Scheduler configuration
+scheduler:
+  name: 'step'
+  scheduler_params:
+    step_size: 50  # Step interval for learning rate decay
+    gamma: 0.7      # Learning rate decay factor
+
+# Training configuration
+train:
+  batch_size: 64
+  num_workers: 4
+  num_epochs: 1000
+  log_interval: 10
+  eval_interval: 5
+  save_interval: 10
+  ckpt_dir: './ckpts/cifar10_ddpm'
+
+# Test configuration
+test:
+  eval_interval: 5  # Interval of epochs for evaluation
+  metrics: ['MSE', 'PSNR']
+
+# Beta scheduler configuration
+beta_scheduler: 'linear'  # Options: 'linear', 'cosine', 'sigmoid'
+
+# Additional settings (if applicable)
+sampling_timesteps: 1000
+schedule_fn_kwargs: {}
+ddim_sampling_eta: 0.0
+immiscible: False

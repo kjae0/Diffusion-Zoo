@@ -71,6 +71,12 @@ class LinearAttention(nn.Module):
             nn.Conv2d(hidden_dim, in_dim, 1),
             RMSNorm(in_dim)
         )
+    
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.to_qkv.weight)
+        
+        nn.init.kaiming_normal_(self.to_out[0].weight)
+        nn.init.zeros_(self.to_out[0].bias)
 
     def forward(self, x):
         b, c, h, w = x.shape
@@ -114,6 +120,12 @@ class Attention2d(nn.Module):
         self.mem_kv = nn.Parameter(torch.randn(2, heads, num_mem_kv, attn_dim))
         self.to_qkv = nn.Conv2d(in_dim, hidden_dim * 3, 1, bias = False)
         self.to_out = nn.Conv2d(hidden_dim, in_dim, 1)
+        
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.to_qkv.weight)
+        
+        nn.init.kaiming_normal_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
 
     def forward(self, x):
         """

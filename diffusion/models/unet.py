@@ -10,21 +10,20 @@ import torch
 import torch.nn as nn
 
 
-class Unet(nn.Module):
-    def __init__(self, in_dim, time_emb_dim,
-        init_dim=None, out_dim=None, dim_mults=(1, 2, 4, 8), channels=3,
-        self_condition=False, learned_variance=False,
-        dropout=0., attn_dim_head=32, attn_heads=4, full_attn=None, flash_attn=False
+class UNet(nn.Module):
+    def __init__(self, image_dim, time_emb_dim, init_dim, 
+                 out_dim=None, dim_mults=(1, 2, 4, 8),
+                 self_condition=False, learned_variance=False,
+                 dropout=0., attn_head_dim=32, attn_heads=4, 
+                 full_attn=None, flash_attn=False
     ):
         super().__init__()
-        self.channels = channels
         self.self_condition = self_condition
-        input_channels = channels * (2 if self_condition else 1)
+        input_dim = image_dim * (2 if self_condition else 1)
 
-        init_dim = init_dim if in_dim else in_dim
-        self.init_conv = nn.Conv2d(input_channels, init_dim, 7, padding=3)
+        self.init_conv = nn.Conv2d(input_dim, init_dim, 7, padding=3)
 
-        dims = [init_dim, *map(lambda m: in_dim * m, dim_mults)]
+        dims = [init_dim, *map(lambda m: init_dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
         
         if not full_attn:
@@ -33,15 +32,15 @@ class Unet(nn.Module):
         num_stages = len(dim_mults)
         full_attn  = full_attn if isinstance(full_attn, tuple) else (full_attn,) * num_stages 
         attn_heads = attn_heads if isinstance(attn_heads, tuple) else (attn_heads,) * num_stages 
-        attn_dim_head = attn_dim_head if isinstance(attn_dim_head, tuple) else (attn_dim_head,) * num_stages 
+        attn_head_dim = attn_head_dim if isinstance(attn_head_dim, tuple) else (attn_head_dim,) * num_stages 
         
-        assert len(full_attn) == len(dim_mults) == len(attn_heads) == len(attn_dim_head), 'length of full_attn, attn_heads, attn_dim_head should be equal to length of dim_mults'
+        assert len(full_attn) == len(dim_mults) == len(attn_heads) == len(attn_head_dim), 'length of full_attn, attn_heads, attn_head_dim should be equal to length of dim_mults'
 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
         num_resolutions = len(in_out)
         
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(in_out, full_attn, attn_heads, attn_dim_head)):
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_head_dim) in enumerate(zip(in_out, full_attn, attn_heads, attn_head_dim)):
             layer = nn.ModuleList([
                 ResnetBlock(dim_in, dim_in, time_emb_dim = time_emb_dim, dropout = dropout),
                 ResnetBlock(dim_in, dim_in, time_emb_dim = time_emb_dim, dropout = dropout)
@@ -49,12 +48,12 @@ class Unet(nn.Module):
             
             if layer_full_attn:
                 layer.append(Attention2d(dim_in, 
-                                       attn_dim = layer_attn_dim_head, 
+                                       attn_dim = layer_attn_head_dim, 
                                        heads = layer_attn_heads,
                                        flash = flash_attn))
             else:
                 layer.append(LinearAttention(dim_in, 
-                                              attn_dim = layer_attn_dim_head, 
+                                              attn_dim = layer_attn_head_dim, 
                                               heads = layer_attn_heads))
             
             if ind >= (num_resolutions - 1):
@@ -67,10 +66,10 @@ class Unet(nn.Module):
 
         mid_dim = dims[-1]
         self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_emb_dim, dropout=dropout)
-        self.mid_attn = Attention2d(mid_dim, heads=attn_heads[-1], attn_dim=attn_dim_head[-1], flash=flash_attn)
+        self.mid_attn = Attention2d(mid_dim, heads=attn_heads[-1], attn_dim=attn_head_dim[-1], flash=flash_attn)
         self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_emb_dim, dropout=dropout)
 
-        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
+        for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_head_dim) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_head_dim)))):
             layer = nn.ModuleList([
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim=time_emb_dim, dropout=dropout),
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim=time_emb_dim, dropout=dropout)
@@ -78,12 +77,12 @@ class Unet(nn.Module):
             
             if layer_full_attn:
                 layer.append(Attention2d(dim_out, 
-                                       attn_dim = layer_attn_dim_head, 
+                                       attn_dim = layer_attn_head_dim, 
                                        heads = layer_attn_heads,
                                        flash = flash_attn))
             else:
                 layer.append(LinearAttention(dim_out, 
-                                              attn_dim = layer_attn_dim_head, 
+                                              attn_dim = layer_attn_head_dim, 
                                               heads = layer_attn_heads))
             
             if ind >= (len(in_out) - 1):
@@ -96,10 +95,35 @@ class Unet(nn.Module):
         if out_dim:
             self.out_dim = out_dim
         else:
-            self.out_dim = channels * (1 if not learned_variance else 2)
+            self.out_dim = image_dim * (1 if not learned_variance else 2)
 
         self.final_res_block = ResnetBlock(init_dim * 2, init_dim, time_emb_dim=time_emb_dim, dropout=dropout)
         self.final_conv = nn.Conv2d(init_dim, self.out_dim, 1)
+        
+        # self._init_weights()  # not working...
+        
+    def _init_weights(self):
+        nn.init.xavier_normal_(self.init_conv.weight)
+        nn.init.zeros_(self.init_conv.bias)
+        
+        for down in self.downs:
+            for block in down:
+                if isinstance(block, nn.Conv2d):
+                    nn.init.xavier_normal_(block.weight)
+                    nn.init.zeros_(block.bias)
+                else:
+                    block._init_weights()
+                    
+        for up in self.ups:
+            for block in up:
+                if isinstance(block, nn.Conv2d):
+                    nn.init.xavier_normal_(block.weight)
+                    nn.init.zeros_(block.bias)
+                else:
+                    block._init_weights()
+                    
+        nn.init.xavier_normal_(self.final_conv.weight)
+        nn.init.zeros_(self.final_conv.bias)
 
     @property
     def downsample_factor(self):
@@ -150,14 +174,14 @@ if __name__ == "__main__":
     x = torch.zeros(10, 3, 32, 32)
     time = torch.zeros(10)
     
-    device = 'cuda'
+    device = 'cuda:3'
     from diffusion.nn.embedding import SinusoidalEmbedding
     time_emb = SinusoidalEmbedding(128)
-    unet = Unet(3,
+    unet = UNet(image_dim=3,
                 init_dim=64, out_dim=3, time_emb_dim=128,
-                dim_mults=(1, 2, 4, 8), channels=3, 
+                dim_mults=(1, 2, 4, 8), 
                 self_condition=False, learned_variance=False, 
-                dropout=0., attn_dim_head=32, 
+                dropout=0., attn_head_dim=32, 
                 attn_heads=4, full_attn=None, flash_attn=False)
     
     time_emb = time_emb.to(device)
@@ -170,5 +194,3 @@ if __name__ == "__main__":
     out = unet(x, te)
     print(out.shape)
         
-    
-    

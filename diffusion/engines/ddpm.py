@@ -1,411 +1,404 @@
+from diffusion.models import build_model
+from diffusion.utils import get_beta_scheduler, Scaler, IdentityScaler
+from diffusion.utils import build_loss_fn, build_optimizer, build_scheduler
+from diffusion.utils import save_checkpoints, get_learning_rate
+from diffusion.utils import shape_matcher_1d, ema
+from diffusion.utils import x0_to_noise, noise_to_x0, velocity_to_x0
+from diffusion.metrics import calculate_mse, calculate_psnr
+from diffusion.models import unet_test
+
+from src.utils import save_images_grid
+
+from tqdm import tqdm
+
+import os
+import copy
+import time
+import random
+import imageio
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-def linear_beta_schedule(timesteps):
-    """
-    linear schedule, proposed in original ddpm paper
-    """
-    scale = 1000 / timesteps
-    beta_start = scale * 0.0001
-    beta_end = scale * 0.02
-    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
-
-def cosine_beta_schedule(timesteps, s = 0.008):
-    """
-    cosine schedule
-    as proposed in https://openreview.net/forum?id=-NEXDKk8gZ
-    """
-    steps = timesteps + 1
-    t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
-    alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0, 0.999)
-
-def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1e-5):
-    """
-    sigmoid schedule
-    proposed in https://arxiv.org/abs/2212.11972 - Figure 8
-    better for images > 64x64, when used during training
-    """
-    steps = timesteps + 1
-    t = torch.linspace(0, timesteps, steps, dtype = torch.float64) / timesteps
-    v_start = torch.tensor(start / tau).sigmoid()
-    v_end = torch.tensor(end / tau).sigmoid()
-    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0, 0.999)
-
-
-class DDPMEngine(nn.Module):
+class DDPMEngine:
     def __init__(
         self,
-        model,
-        *,
-        image_size,
-        timesteps = 1000,
+        cfg,
         sampling_timesteps = None,
-        objective = 'pred_v',
-        beta_schedule = 'sigmoid',
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
-        auto_normalize = True,
-        offset_noise_strength = 0.,  # https://www.crosslabs.org/blog/diffusion-with-offset-noise
-        min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
-        min_snr_gamma = 5,
+        # min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556  # TODO
+        # min_snr_gamma = 5,
         immiscible = False
     ):
-        super().__init__()
-        assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
-        assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
-
-        self.model = model
-        self.pe = None
-
-        self.channels = self.model.channels
-        self.self_condition = self.model.self_condition
-
-        if isinstance(image_size, int):
-            image_size = (image_size, image_size)
-        assert isinstance(image_size, (tuple, list)) and len(image_size) == 2, 'image size must be a integer or a tuple/list of two integers'
-        self.image_size = image_size
-
-        self.objective = objective
-
-        assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
-
-        if beta_schedule == 'linear':
-            beta_schedule_fn = linear_beta_schedule
-        elif beta_schedule == 'cosine':
-            beta_schedule_fn = cosine_beta_schedule
-        elif beta_schedule == 'sigmoid':
-            beta_schedule_fn = sigmoid_beta_schedule
+        self.model, self.time_embedding = build_model(cfg['model'])
+    
+        if cfg['ema']:
+            self.ema_model = copy.deepcopy(self.model)
+            self.ema_decay = cfg['ema_decay']
         else:
-            raise ValueError(f'unknown beta schedule {beta_schedule}')
-
-        betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
-
+            self.ema_model = None
+        self.ema = cfg['ema']
+        
+        model_size = 0
+        for param in self.model.parameters():
+            model_size += param.data.nelement()
+        print('Model params: %.2f M' % (model_size / 1024 / 1024))
+        
+        self.loss_fn = build_loss_fn(cfg['loss'])
+        self.optimizer = build_optimizer(cfg['optimizer'], self.model.parameters())
+        self.scheduler = build_scheduler(cfg['scheduler'], self.optimizer)
+        
+        self.device = cfg['device']
+        self.verbose = cfg['verbose']
+        self.clip_grad_norm = cfg['clip_grad_norm']
+        self.offset_noise_strength = cfg['offset_noise_strength']
+        self.image_size = cfg['image_size']
+        self.timesteps = cfg['timesteps']
+        self.self_cond = cfg['self_condition']
+        self.loss_weight = cfg['min_snr_loss_weight']
+        self.input_range = cfg['input_range']
+        self.prediction_type = cfg['prediction_type']
+        
+        if self.loss_weight:
+            raise NotImplementedError('min_snr_loss_weight is not supported yet')
+        
+        if self.input_range[0] != 0 or self.input_range[1] != 1 or self.input_range[0] > self.input_range[1] != 1:
+            self.normalizer = Scaler(self.input_range)
+        else:
+            self.normalizer = IdentityScaler()
+        
+        betas = get_beta_scheduler(cfg['beta_scheduler'])(self.timesteps, **schedule_fn_kwargs)
         alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
-
-        timesteps, = betas.shape
-        self.num_timesteps = int(timesteps)
-
-        # sampling related parameters
-
-        self.sampling_timesteps = default(sampling_timesteps, timesteps) # default num sampling timesteps to number of timesteps at training
-
-        assert self.sampling_timesteps <= timesteps
-        self.is_ddim_sampling = self.sampling_timesteps < timesteps
-        self.ddim_sampling_eta = ddim_sampling_eta
-
-        # helper function to register buffer from float64 to float32
-
-        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
-
-        register_buffer('betas', betas)
-        register_buffer('alphas_cumprod', alphas_cumprod)
-        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-
-        # calculations for diffusion q(x_t | x_{t-1}) and others
-
-        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
-        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
-        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
-        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
-
-        # calculations for posterior q(x_{t-1} | x_t, x_0)
-
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
-
-        register_buffer('posterior_variance', posterior_variance)
-
-        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
-
-        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
-        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
-        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
-
-        # immiscible diffusion
-
-        self.immiscible = immiscible
-
-        # offset noise strength - in blogpost, they claimed 0.1 was ideal
-
-        self.offset_noise_strength = offset_noise_strength
-
-        # derive loss weight
-        # snr - signal noise ratio
-
-        snr = alphas_cumprod / (1 - alphas_cumprod)
-
-        # https://arxiv.org/abs/2303.09556
-
-        maybe_clipped_snr = snr.clone()
-        if min_snr_loss_weight:
-            maybe_clipped_snr.clamp_(max = min_snr_gamma)
-
-        if objective == 'pred_noise':
-            register_buffer('loss_weight', maybe_clipped_snr / snr)
-        elif objective == 'pred_x0':
-            register_buffer('loss_weight', maybe_clipped_snr)
-        elif objective == 'pred_v':
-            register_buffer('loss_weight', maybe_clipped_snr / (snr + 1))
-
-        # auto-normalization of data [0, 1] -> [-1, 1] - can turn off by setting it to be False
-
-        self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
-        self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
-
-    @property
-    def device(self):
-        return self.betas.device
-
-    def predict_start_from_noise(self, x_t, t, noise):
-        return (
-            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
-        )
-
-    def predict_noise_from_start(self, x_t, t, x0):
-        return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-        )
-
-    def predict_v(self, x_start, t, noise):
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
-        )
-
-    def predict_start_from_v(self, x_t, t, v):
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
-        )
-
-    def q_posterior(self, x_start, x_t, t):
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
-            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        model_output = self.model(x, t, x_self_cond)
-        maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
-
-        if self.objective == 'pred_noise':
-            pred_noise = model_output
-            x_start = self.predict_start_from_noise(x, t, pred_noise)
-            x_start = maybe_clip(x_start)
-
-            if clip_x_start and rederive_pred_noise:
-                pred_noise = self.predict_noise_from_start(x, t, x_start)
-
-        elif self.objective == 'pred_x0':
-            x_start = model_output
-            x_start = maybe_clip(x_start)
-            pred_noise = self.predict_noise_from_start(x, t, x_start)
-
-        elif self.objective == 'pred_v':
-            v = model_output
-            x_start = self.predict_start_from_v(x, t, v)
-            x_start = maybe_clip(x_start)
-            pred_noise = self.predict_noise_from_start(x, t, x_start)
-
-        return ModelPrediction(pred_noise, x_start)
-
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
-        x_start = preds.pred_x_start
-
-        if clip_denoised:
-            x_start.clamp_(-1., 1.)
-
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start = x_start, x_t = x, t = t)
-        return model_mean, posterior_variance, posterior_log_variance, x_start
-
-    @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
-        b, *_, device = *x.shape, self.device
-        batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
-        noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
-        pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
-        return pred_img, x_start
-
-    @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
-        batch, device = shape[0], self.device
-
-        img = torch.randn(shape, device = device)
-        imgs = [img]
-
-        x_start = None
-
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
-            imgs.append(img)
-
-        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
-
-        ret = self.unnormalize(ret)
-        return ret
-
-    @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
-        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-
-        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-
-        img = torch.randn(shape, device = device)
-        imgs = [img]
-
-        x_start = None
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
-            self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, rederive_pred_noise = True)
-
-            if time_next < 0:
-                img = x_start
-                imgs.append(img)
-                continue
-
-            alpha = self.alphas_cumprod[time]
-            alpha_next = self.alphas_cumprod[time_next]
-
-            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            c = (1 - alpha_next - sigma ** 2).sqrt()
-
-            noise = torch.randn_like(img)
-
-            img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-
-            imgs.append(img)
-
-        ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
-
-        ret = self.unnormalize(ret)
-        return ret
-
-    @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
-        (h, w), channels = self.image_size, self.channels
-        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
-
-    @torch.inference_mode()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
-        b, *_, device = *x1.shape, x1.device
-        t = default(t, self.num_timesteps - 1)
-
-        assert x1.shape == x2.shape
-
-        t_batched = torch.full((b,), t, device = device)
-        xt1, xt2 = map(lambda x: self.q_sample(x, t = t_batched), (x1, x2))
-
-        img = (1 - lam) * xt1 + lam * xt2
-
-        x_start = None
-
-        for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
-            self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
-
-        return img
-
-    def noise_assignment(self, x_start, noise):
-        x_start, noise = tuple(rearrange(t, 'b ... -> b (...)') for t in (x_start, noise))
-        dist = torch.cdist(x_start, noise)
-        _, assign = linear_sum_assignment(dist.cpu())
-        return torch.from_numpy(assign).to(dist.device)
-
-    @autocast('cuda', enabled = False)
-    def q_sample(self, x_start, t, noise = None):
-        noise = default(noise, lambda: torch.randn_like(x_start))
-
-        if self.immiscible:
-            assign = self.noise_assignment(x_start, noise)
-            noise = noise[assign]
-
-        return (
-            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
-            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
-        )
-
-    def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
-        b, c, h, w = x_start.shape
-
-        noise = default(noise, lambda: torch.randn_like(x_start))
-
-        # offset noise - https://www.crosslabs.org/blog/diffusion-with-offset-noise
-
-        offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
-
-        if offset_noise_strength > 0.:
-            offset_noise = torch.randn(x_start.shape[:2], device = self.device)
-            noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
-
-        # noise sample
-
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
-
-        x_self_cond = None
-        if self.self_condition and random() < 0.5:
-            with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
-                x_self_cond.detach_()
-
-        # predict and take gradient step
-
-        model_out = self.model(x, t, x_self_cond)
-
-        if self.objective == 'pred_noise':
-            target = noise
-        elif self.objective == 'pred_x0':
-            target = x_start
-        elif self.objective == 'pred_v':
-            v = self.predict_v(x_start, t, noise)
-            target = v
+        alphas_bar = torch.cumprod(alphas, dim=0)
+        alphas_bar_prev = F.pad(alphas_bar[:-1], (1, 0), value=1.)
+        
+        # predefine those for reduce repetitive computation
+        self.one_minus_alphas_bar = 1. - alphas_bar
+        self.sqrt_alphas_bar = torch.sqrt(alphas_bar)
+        self.sqrt_one_minus_alphas_bar = torch.sqrt(1. - alphas_bar)
+        self.p_sampling_coef_x0 = betas * torch.sqrt(alphas_bar_prev) / (1. - alphas_bar)
+        self.p_sampling_coef_xt = torch.sqrt(alphas) * (1. - alphas_bar_prev) / (1. - alphas_bar)
+        self.betas_tilda = betas * (1. - alphas_bar_prev) / (1. - alphas_bar)
+        self.log_betas_tilda = torch.log(self.betas_tilda.clamp(min =1e-20))
+    
+        self.sampling_timesteps = sampling_timesteps if sampling_timesteps is not None else self.timesteps
+        
+        assert self.sampling_timesteps <= self.timesteps, 'sampling timesteps cannot be greater than total timesteps'
+
+    def train(self, cfg, train_dataset, test_dataset, verbose=True):
+        train_dataloader = torch.utils.data.DataLoader(train_dataset, 
+                                                       batch_size=cfg['batch_size'], 
+                                                       shuffle=True, 
+                                                       drop_last=True,
+                                                       num_workers=cfg['num_workers'])
+        
+        epochs = range(cfg['num_epochs'])
+                    
+        for epoch in epochs:
+            train_loss, elapsed_time = self.train_one_epoch(train_dataloader, verbose=False, log_interval=cfg['log_interval'])
+            
+            print(f"{epoch+1} / {cfg['num_epochs']} Train Loss", end=" ")
+            print(f"Train loss - {train_loss:6f}", end=" ")
+            print(f"Time: {elapsed_time:2f} Lr: {get_learning_rate(self.optimizer)}")
+            
+            if self.scheduler is not None:
+                self.scheduler.step()
+            
+            # evaluate
+            if (epoch+1) % cfg['eval_interval'] == 0: 
+                out, _ = self.p_sample([25, 3, 32, 32])
+                save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
+                
+            #     metric_dict = {'MSE': calculate_mse, 'PSNR': calculate_psnr}
+            #     perf, preds, gts, elapsed_time = self.evaluate(cfg, test_dataset, metric_dict, hwf=(H, W, focal))
+
+            #     print(f"\n{epoch+1} / {cfg['train']['num_epochs']} Eval Results")
+            #     for k, v in perf.items():
+            #         print(f"{k}: {v}")
+            #     print(f"Time: {elapsed_time:2f}\n")                
+            
+            # TODO tensorboard logging...
+            # if self.writer is not None:
+                # self.writer.add_scalar("Train Loss", train_loss, epoch)
+                            
+            if (epoch+1) % cfg['save_interval'] == 0:
+                ckpt = {
+                    'diffusion': self.model.state_dict(),
+                    'ema_model': self.ema_model.state_dict() if self.ema else None,
+                    'time_embedding': self.time_embedding.state_dict(),
+                    'optimizer': self.optimizer.state_dict(),
+                    'scheduler': self.scheduler.state_dict(),
+                    'random_states': {
+                        'torch': torch.get_rng_state(),
+                        'numpy': np.random.get_state(),
+                        'python': random.getstate()
+                    }
+                }
+                
+                if not os.path.exists(cfg['ckpt_dir']):
+                    os.makedirs(cfg['ckpt_dir'], exist_ok=True)
+                    
+                save_checkpoints(ckpt_path=os.path.join(cfg['ckpt_dir'], f"ckpt_{epoch+1}.pt"),
+                                 ckpt=ckpt,
+                                 epoch=epoch+1,
+                                 train_loss=train_loss,
+                                 val_loss=None)
+        
+    def evaluate(self, cfg, test_dataset):
+        test_dataloader = torch.utils.data.DataLoader(test_dataset, 
+                                                      batch_size=cfg['batch_size'], 
+                                                      shuffle=False, 
+                                                      drop_last=False,
+                                                      num_workers=cfg['num_workers'])
+        
+        for x0, cls in test_dataloader:
+            x0 = x0.to(self.device)
+            x0 = self.normalizer.normalize(x0)
+            cls = cls.to(self.device)
+            
+            noise = torch.randn_like(x0).to(self.device)
+            
+            if self.offset_noise_strength > 0.:
+                offset_noise = torch.randn(x0.shape[:2], device=self.device)
+                noise += self.offset_noise_strength * offset_noise.unsqueeze(-1).unsqueeze(-1)
+            
+            xt = self.q_sample(x0, noise, time_steps).float()
+            
+            x_self_cond = None
+            if self.self_cond and random() < 0.5:
+                with torch.no_grad():
+                    x_self_cond = self.model_predictions(xt, time_steps).pred_x_start
+                    x_self_cond.detach_()
+            
+            time_emb = self.time_embedding(time_steps)
+            pred = self.model(xt, time_emb, x_self_cond=x_self_cond)
+            pred = self.postprocessing(pred, xt, time_steps)
+            
+            loss = self.loss_fn(pred['noise'], noise)
+            
+            # TODO
+            # conve rt target following prediction type
+            loss = self.loss_fn(pred['noise'], noise)
+            
+            return loss.item()
+        
+    def run_network(self, x, time_step, self_cond=None, use_ema=False):
+        """
+            Run unet network. predict mean
+        """
+        # TODO: cond
+        if self_cond is not None:
+            self_cond = self_cond.float()
+            
+        time_emb = self.time_embedding(time_step)
+        
+        if use_ema:
+            pred = self.ema_model(x.float(), time_emb, x_self_cond=self_cond)
         else:
-            raise ValueError(f'unknown objective {self.objective}')
+            pred = self.model(x.float(), time_emb, x_self_cond=self_cond)
+        # pred = self.model(x.float(), time_step)
+        
+        return pred
+    
+    def postprocessing(self, pred, xt, time_steps, clip_x0=True):
+        # 3 modes
+        ret = {
+            'x0': None,
+            'noise': None
+        }
+         
+        # 1. predict noise
+        # following DDPM / predict noise (mean)
+        # https://arxiv.org/abs/2006.11239
+        if self.prediction_type == 'noise':
+            ret['x0'] = noise_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.sqrt_one_minus_alphas_bar[time_steps])
+            ret['noise'] = pred
+        
+        # 2. predict velocity
+        # following ... ?
+        # https://arxiv.org/pdf/2202.00512
+        elif self.prediction_type == 'velocity':
+            ret['x0'] = velocity_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+            ret['noise'] = x0_to_noise(ret['x0'], xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+            
+        # 3. predict x0
+        # following DDIM?
+        elif self.prediction_type == 'x0':
+            ret['x0'] = pred
+            ret['noise'] = x0_to_noise(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+        
+        if clip_x0:
+            ret['x0'] = ret['x0'].clamp(self.input_range[0], self.input_range[1])
+            
+        return ret
+    
+    def train_one_epoch(self, dataloader, verbose=True, log_interval=10):
+        if verbose:
+            dataloader = tqdm(dataloader, ncols=100, desc='Training...')
+        
+        total_loss = 0
+        n_iter = 0
+        s = time.time()
+        si = time.time()
+        for iter, (x0, cls) in enumerate(dataloader):
+            # B
+            time_steps = torch.randint(0, self.sampling_timesteps, (x0.shape[0],), device=self.device).long()
+            
+            # B x 3 x H x W
+            x0 = x0.to(self.device)
+            x0 = self.normalizer.normalize(x0)
+            # cls = cls.to(self.device) # available only class guidance is used
+            time_steps = time_steps.to(self.device)
+            
+            # B x 3 x H x W
+            noise = torch.randn_like(x0).to(self.device)
+            
+            # TODO offset noise strength
+            if self.offset_noise_strength > 0.:
+                offset_noise = torch.randn(x0.shape[:2], device = self.device) # B x C
+                noise += self.offset_noise_strength * offset_noise.unsqueeze(-1).unsqueeze(-1)
+                
+            xt = self.q_sample(x0, noise, time_steps).float()
+            
+            # if doing self-conditioning, 50% of the time, predict x_start from current set of times
+            # and condition with unet with that
+            # this technique will slow down training by 25%, but seems to lower FID significantly
+            x_self_cond = None
+            if self.self_cond and random.random() < 0.5:
+                with torch.no_grad():
+                    pred = self.run_network(xt, time_steps, x_self_cond, use_ema=False)
+                    pred = self.postprocessing(pred, xt, time_steps)
+                    x_self_cond = pred['x0'].float().detach()
+            
+            # B x 3 x H x W
+            pred = self.run_network(xt, time_steps, x_self_cond, use_ema=False)
+            pred = self.postprocessing(pred, xt, time_steps)
 
-        loss = F.mse_loss(model_out, target, reduction = 'none')
-        loss = reduce(loss, 'b ... -> b', 'mean')
+            # TODO
+            # convert target following prediction type
+            if self.prediction_type == 'noise':
+                loss = self.loss_fn(pred['noise'], noise)
+            elif self.prediction_type == 'velocity':
+                pass
+            elif self.prediction_type == 'x0':
+                pass
+            else:
+                raise NotImplementedError(f"Prediction type {self.prediction_type} is not supported yet")
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            self.optimizer.step()
+            
+            if self.ema:
+                ema(self.model, self.ema_model, self.ema_decay)
 
-        loss = loss * extract(self.loss_weight, t, loss.shape)
-        return loss.mean()
+            
+            total_loss += loss.item()
+            n_iter += 1
+            
+            if self.verbose and ((iter+1) % log_interval == 0):
+                print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
+                si = time.time()
+                # break
+            
+        return total_loss / n_iter, time.time() - s
+    
+    def ddim_sample(self,):
+        pass
+    
+    def q_sample(self, x0, noise, time_steps):
+        # TODO immiscrible
+        
+        # B x C x H x W
+        noised = shape_matcher_1d(self.sqrt_alphas_bar[time_steps], x0.shape) * x0 + \
+            shape_matcher_1d(self.sqrt_one_minus_alphas_bar[time_steps], noise.shape) * noise
+            
+        return noised
+    
+    @torch.no_grad()
+    def p_sample(self, sample_shape=None, return_trajectory=False, verbose=True):
+        self.model.eval()
+        self.time_embedding.eval()
 
-    def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}'
-        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        ret = []
+        
+        sample_shape = self.image_size if sample_shape is None else sample_shape
+        
+        xT = torch.randn(sample_shape).to(self.device)
+        
+        time_steps = reversed(range(self.sampling_timesteps))
+        if verbose:
+            time_steps = tqdm(time_steps, ncols=100, total=self.sampling_timesteps, desc='Sampling...') 
+        
+        self_cond = None
+        xt = xT
+        for t in time_steps:
+            out = self._p_sample_iter(xt, t, self_cond)
+            xt = out['x_t-1']
+            self_cond = out['x0']
+            
+            if return_trajectory:
+                ret.append(xt.cpu())
+                
+        self.model.train()
+        self.time_embedding.train()
 
-        img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.normalizer.unnormalize(xt.cpu()), ret
+    
+    @torch.no_grad()
+    def _p_sample_iter(self, xt, t, self_cond, clip_x0=True):
+        assert len(xt.shape) == 4, 'input shape must be B x C x H x W'
+        
+        ret = {'x_t-1': None,
+               'x0': None}
+        
+        B = xt.shape[0]
+        batch_t = torch.full((B,), t, device=self.device, dtype=torch.long)    # B
+        noise = torch.randn_like(xt) if t > 0 else 0.
+        
+        pred = self.run_network(xt, batch_t, self_cond, use_ema=self.ema)
+        pred = self.postprocessing(pred, xt, batch_t, clip_x0)        
+
+        mean = pred['x0'] * shape_matcher_1d(self.p_sampling_coef_x0[t], pred['x0'].shape) + \
+            xt * shape_matcher_1d(self.p_sampling_coef_xt[t], xt.shape)
+        var = self.betas_tilda[t]             # B
+        var_log = self.log_betas_tilda[t]     # B
+        
+        # TODO check var clipping
+        x_updated = mean + (0.5 * var_log).exp() * noise
+        
+        ret['x_t-1'] = x_updated
+        ret['x0'] = pred['x0']
+        
+        return ret
+        
+    def to(self, device):
+        self.model.to(device)
+        self.time_embedding.to(device)
+        self.device = device
+        self.one_minus_alphas_bar = self.one_minus_alphas_bar.to(device)
+        self.sqrt_alphas_bar = self.sqrt_alphas_bar.to(device)
+        self.sqrt_one_minus_alphas_bar = self.sqrt_one_minus_alphas_bar.to(device)
+        self.p_sampling_coef_x0 = self.p_sampling_coef_x0.to(device)
+        self.p_sampling_coef_xt = self.p_sampling_coef_xt.to(device)
+        self.betas_tilda = self.betas_tilda.to(device)
+        self.log_betas_tilda = self.log_betas_tilda.to(device)
+        
+        if self.ema:
+            self.ema_model.to(device)
+        
+        return self
+    
+    def load_state_dict(self, state_dict):
+        ckpt = state_dict['checkpoint']
+        self.model.load_state_dict(ckpt['diffusion'])
+        self.ema_model.load_state_dict(ckpt['ema_model'])
+        self.time_embedding.load_state_dict(ckpt['time_embedding'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        self.scheduler.load_state_dict(ckpt['scheduler'])
+        
+        print(f"Loaded state dict from epoch {state_dict['epoch']}")

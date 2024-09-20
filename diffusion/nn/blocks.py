@@ -14,6 +14,10 @@ class UpSamplingBlock(nn.Module):
             nn.Upsample(scale_factor = factor, mode = 'nearest'),
             nn.Conv2d(in_dim, out_dim, 3, padding = 1)
         )
+        
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.block[1].weight)
+        nn.init.zeros_(self.block[1].bias)
     
     def forward(self, x):
         return self.block(x)
@@ -23,9 +27,12 @@ class DownSamplingBlock(nn.Module):
     def __init__(self, in_dim, out_dim, factor=2):
         super().__init__()
         self.block = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (c p1 p2) h w', p1 = factor, p2 = factor),
-            nn.Conv2d(in_dim * 4, out_dim, 1)
+            nn.Conv2d(in_dim, out_dim, 3, padding=1, stride=factor),
         )
+    
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.block[0].weight)
+        nn.init.zeros_(self.block[0].bias)
         
     def forward(self, x):
         return self.block(x)
@@ -38,6 +45,10 @@ class Conv2dBlock(nn.Module):
         self.norm = norm_fn(out_dim)
         self.act = act_fn
         self.dropout = nn.Dropout(dropout)
+        
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
 
     def forward(self, x, scale_shift=None):
         x = self.conv(x)
@@ -52,7 +63,7 @@ class Conv2dBlock(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, *, time_emb_dim = None, dropout = 0.):
+    def __init__(self, in_dim, out_dim, time_emb_dim = None, dropout = 0.):
         super().__init__()
         
         if time_emb_dim:
@@ -67,6 +78,14 @@ class ResnetBlock(nn.Module):
         self.block1 = Conv2dBlock(in_dim, out_dim, dropout = dropout)
         self.block2 = Conv2dBlock(out_dim, out_dim)
         self.res_conv = nn.Conv2d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+
+    def _init_weights(self):
+        self.block1._init_weights()
+        self.block2._init_weights()
+        
+        if not isinstance(self.res_conv, nn.Identity):
+            nn.init.kaiming_normal_(self.res_conv.weight)
+            nn.init.zeros_(self.res_conv.bias)
 
     def forward(self, x, time_emb = None):
         scale_shift = None
