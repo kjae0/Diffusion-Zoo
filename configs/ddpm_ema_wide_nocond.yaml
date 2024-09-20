@@ -64,7 +64,7 @@ train:
   num_workers: 4
   num_epochs: 1000
   log_interval: 10
-  eval_interval: 10
+  eval_interval: 20
   save_interval: 10
   ckpt_dir: './ckpts/'
 
@@ -81,3 +81,9 @@ sampling_timesteps: 1000
 schedule_fn_kwargs: {}
 ddim_sampling_eta: 0.0
 immiscible: False
+
+metric:
+  max_pixel_value: 1.
+  batch_size: 64 
+  inception_block_idx: 2048
+  cache_fid_stats: true

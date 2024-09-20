@@ -4,7 +4,7 @@ from diffusion.utils import build_loss_fn, build_optimizer, build_scheduler
 from diffusion.utils import save_checkpoints, get_learning_rate
 from diffusion.utils import shape_matcher_1d, ema
 from diffusion.utils import x0_to_noise, noise_to_x0, velocity_to_x0
-from diffusion.metrics import calculate_mse, calculate_psnr
+from diffusion.metrics import MetricCalculator
 from diffusion.models import unet_test
 
 from src.utils import save_images_grid
@@ -88,13 +88,19 @@ class DDPMEngine:
         
         assert self.sampling_timesteps <= self.timesteps, 'sampling timesteps cannot be greater than total timesteps'
 
-    def train(self, cfg, train_dataset, test_dataset, verbose=True):
+        self.metric_calculator = MetricCalculator(device=self.device, **cfg['metrics'])
+
+    def train(self, cfg, train_dataset, verbose=True):
         train_dataloader = torch.utils.data.DataLoader(train_dataset, 
                                                        batch_size=cfg['batch_size'], 
                                                        shuffle=True, 
                                                        drop_last=True,
                                                        num_workers=cfg['num_workers'])
-        
+        test_dataloader = torch.utils.data.DataLoader(train_dataset,
+                                                        batch_size=cfg['batch_size'],
+                                                        shuffle=False,
+                                                        drop_last=False,
+                                                        num_workers=cfg['num_workers'])
         epochs = range(cfg['num_epochs'])
                     
         for epoch in epochs:
@@ -112,13 +118,15 @@ class DDPMEngine:
                 out, _ = self.p_sample([25, 3, 32, 32])
                 save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
                 
-            #     metric_dict = {'MSE': calculate_mse, 'PSNR': calculate_psnr}
-            #     perf, preds, gts, elapsed_time = self.evaluate(cfg, test_dataset, metric_dict, hwf=(H, W, focal))
+                n_samples = len(train_dataset)
+                fid_stats_dir = cfg['fid_stats_dir'] if 'fid_stats_dir' in cfg else None
+                
+                perf, elapsed_time = self.evaluate(n_samples, cfg['batch_size'], test_dataloader, fid_stats_dir, verbose=True)
 
-            #     print(f"\n{epoch+1} / {cfg['train']['num_epochs']} Eval Results")
-            #     for k, v in perf.items():
-            #         print(f"{k}: {v}")
-            #     print(f"Time: {elapsed_time:2f}\n")                
+                print(f"\n{epoch+1} / {cfg['train']['num_epochs']} Eval Results")
+                for k, v in perf.items():
+                    print(f"{k}: {v}")
+                print(f"Time: {elapsed_time:2f}\n")                
             
             # TODO tensorboard logging...
             # if self.writer is not None:
@@ -147,44 +155,28 @@ class DDPMEngine:
                                  train_loss=train_loss,
                                  val_loss=None)
         
-    def evaluate(self, cfg, test_dataset):
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, 
-                                                      batch_size=cfg['batch_size'], 
-                                                      shuffle=False, 
-                                                      drop_last=False,
-                                                      num_workers=cfg['num_workers'])
+    def evaluate(self, n_samples, batch_size, test_dl, fid_stats_dir=None, verbose=False):
+        sampled_images = []
+        ret = {
+            'FID': None
+        }
         
-        for x0, cls in test_dataloader:
-            x0 = x0.to(self.device)
-            x0 = self.normalizer.normalize(x0)
-            cls = cls.to(self.device)
+        if verbose:
+            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Evaluating...')
+        else:
+            sample_iter = range(0, n_samples, batch_size)
             
-            noise = torch.randn_like(x0).to(self.device)
-            
-            if self.offset_noise_strength > 0.:
-                offset_noise = torch.randn(x0.shape[:2], device=self.device)
-                noise += self.offset_noise_strength * offset_noise.unsqueeze(-1).unsqueeze(-1)
-            
-            xt = self.q_sample(x0, noise, time_steps).float()
-            
-            x_self_cond = None
-            if self.self_cond and random() < 0.5:
-                with torch.no_grad():
-                    x_self_cond = self.model_predictions(xt, time_steps).pred_x_start
-                    x_self_cond.detach_()
-            
-            time_emb = self.time_embedding(time_steps)
-            pred = self.model(xt, time_emb, x_self_cond=x_self_cond)
-            pred = self.postprocessing(pred, xt, time_steps)
-            
-            loss = self.loss_fn(pred['noise'], noise)
-            
-            # TODO
-            # conve rt target following prediction type
-            loss = self.loss_fn(pred['noise'], noise)
-            
-            return loss.item()
+        for b in sample_iter:
+            out, _ = self.p_sample([batch_size, 3, 32, 32], verbose=False)
+            sampled_images.append(out)
+        sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x 32 x 32
         
+        sample_dl = torch.chunk(sampled_images, batch_size, dim=0)
+        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, self.device, verbose=verbose)
+        ret['FID'] = fid_score
+        
+        return ret
+
     def run_network(self, x, time_step, self_cond=None, use_ema=False):
         """
             Run unet network. predict mean

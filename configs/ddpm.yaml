@@ -7,7 +7,7 @@ offset_noise_strength: 0.0
 image_size: [3, 32, 32]
 self_condition: True
 min_snr_loss_weight: False
-input_range: [0, 1]
+input_range: [-1, 1]
 prediction_type: 'noise'
 clip_grad_norm: 1.0
 ema: False
@@ -64,7 +64,7 @@ train:
   num_workers: 4
   num_epochs: 1000
   log_interval: 10
-  eval_interval: 10
+  eval_interval: 1
   save_interval: 10
   ckpt_dir: './ckpts/'
 
@@ -81,3 +81,9 @@ sampling_timesteps: 1000
 schedule_fn_kwargs: {}
 ddim_sampling_eta: 0.0
 immiscible: False
+
+metric:
+  max_pixel_value: 1.
+  batch_size: 64 
+  inception_block_idx: 2048
+  cache_fid_stats: true
