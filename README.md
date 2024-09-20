@@ -3,7 +3,7 @@ Building model zoo of diffusion models ...
 
 ### Todo
 - [x] DDPM <br>
-- [ ]DDIM <br>
+- [ ] DDIM <br>
 - [ ] CLF guid <br>
 - [ ] CLF free guid <br>
 - [ ] NCSN <br>
