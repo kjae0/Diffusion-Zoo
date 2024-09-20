@@ -118,12 +118,13 @@ class DDPMEngine:
                 out, _ = self.p_sample([25, 3, 32, 32])
                 save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
                 
-                n_samples = len(train_dataset)
+                # n_samples = len(train_dataset)
+                n_samples = cfg['n_eval_samples']
                 fid_stats_dir = cfg['fid_stats_dir'] if 'fid_stats_dir' in cfg else None
                 
                 perf, elapsed_time = self.evaluate(n_samples, cfg['batch_size'], test_dataloader, fid_stats_dir, verbose=True)
 
-                print(f"\n{epoch+1} / {cfg['train']['num_epochs']} Eval Results")
+                print(f"\n{epoch+1} / {cfg['num_epochs']} Eval Results")
                 for k, v in perf.items():
                     print(f"{k}: {v}")
                 print(f"Time: {elapsed_time:2f}\n")                
@@ -161,8 +162,9 @@ class DDPMEngine:
             'FID': None
         }
         
+        s = time.time()
         if verbose:
-            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Evaluating...')
+            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Sampling...')
         else:
             sample_iter = range(0, n_samples, batch_size)
             
@@ -172,10 +174,10 @@ class DDPMEngine:
         sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x 32 x 32
         
         sample_dl = torch.chunk(sampled_images, batch_size, dim=0)
-        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, self.device, verbose=verbose)
+        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, verbose=verbose)
         ret['FID'] = fid_score
         
-        return ret
+        return ret, time.time() - s
 
     def run_network(self, x, time_step, self_cond=None, use_ema=False):
         """
@@ -296,6 +298,8 @@ class DDPMEngine:
                 print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
                 si = time.time()
                 # break
+            
+            # break
             
         return total_loss / n_iter, time.time() - s
     

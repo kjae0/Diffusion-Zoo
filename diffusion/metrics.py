@@ -66,7 +66,9 @@ class MetricCalculator:
         
         outs = []
         for x in dataloader:
-            x = x.to(device)
+            if isinstance(x, (list, tuple)):
+                x = x[0]
+            x = x.to(device).float()
             out = self.inception_v3(x)[0]
             
             if out.shape[2] != 1 or out.shape[3] != 1:
@@ -83,6 +85,8 @@ class MetricCalculator:
     def _get_fid_stats(self, fid_stat_dir, image_real, device, verbose=False):
         if fid_stat_dir:
             self.fid_stats = torch.load(fid_stat_dir)
+            print("FID statistics loaded from", fid_stat_dir)
+            # print("Mean:", self.fid_stats['mean'].shape)
         else:
             mean, cov = self._fid_iteration(image_real, device, verbose=verbose)
             self.fid_stats['mean'] = mean

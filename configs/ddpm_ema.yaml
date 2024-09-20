@@ -67,7 +67,9 @@ train:
   eval_interval: 20
   save_interval: 10
   ckpt_dir: './ckpts/'
-
+  fid_stats_dir: './diffusion/engines/fid_stats.pth'
+  n_eval_samples: 1000
+  
 # Test configuration
 test:
   eval_interval: 5  # Interval of epochs for evaluation
