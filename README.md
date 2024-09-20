@@ -25,12 +25,12 @@ You can easily customize ..... modifying engine and model....
 
 | Fern | Flower | T-Rex |
 |-|-|-|
-| ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) | ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) | ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) |
+|   |   |   |
 
 ### <center> NeRF </center>
 
 | Fern | Flower | T-Rex |
 |-|-|-|
-| ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) | ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) | ![](https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif) |
+|   |   |   |
 
 
