@@ -2,9 +2,9 @@
 Building model zoo of diffusion models ...
 
 ### Todo
-[x] DDPM
-[ ]DDIM
-[ ] CLF guid
-[ ] CLF free guid
-[ ] NCSN
-[ ] NCSN v2
+[x] DDPM <br>
+[ ]DDIM <br>
+[ ] CLF guid <br>
+[ ] CLF free guid <br>
+[ ] NCSN <br>
+[ ] NCSN v2 <br>
