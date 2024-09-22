@@ -20,6 +20,9 @@ class UNet(nn.Module):
         super().__init__()
         self.self_condition = self_condition
         input_dim = image_dim * (2 if self_condition else 1)
+        
+        if self_condition:
+            print('self_condition is True')
 
         self.init_conv = nn.Conv2d(input_dim, init_dim, 7, padding=3)
 
@@ -27,7 +30,7 @@ class UNet(nn.Module):
         in_out = list(zip(dims[:-1], dims[1:]))
         
         if not full_attn:
-            full_attn = (*((False,) * (len(dim_mults) - 1)), True)
+            full_attn = (*((False,) * (len(dim_mults) - 2)), True, False)
 
         num_stages = len(dim_mults)
         full_attn  = full_attn if isinstance(full_attn, tuple) else (full_attn,) * num_stages 

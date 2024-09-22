@@ -8,6 +8,20 @@ import torch.nn as nn
 #             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
 #         )
 
+def remove_module_from_state_dict(state_dict):
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('module.'):
+            new_state_dict[key[7:]] = value
+        else:
+            new_state_dict[key] = value
+    return new_state_dict
+
+def get_model_state_dict(model):
+    if isinstance(model, nn.DataParallel):
+        return model.module.state_dict()
+    return model.state_dict()
+
 def ema(source, target, decay):
     source_dict = source.state_dict()
     target_dict = target.state_dict()

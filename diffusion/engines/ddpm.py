@@ -4,6 +4,7 @@ from diffusion.utils import build_loss_fn, build_optimizer, build_scheduler
 from diffusion.utils import save_checkpoints, get_learning_rate
 from diffusion.utils import shape_matcher_1d, ema
 from diffusion.utils import x0_to_noise, noise_to_x0, velocity_to_x0
+from diffusion.utils import get_model_state_dict
 from diffusion.metrics import MetricCalculator
 from diffusion.models import unet_test
 
@@ -26,15 +27,13 @@ class DDPMEngine:
     def __init__(
         self,
         cfg,
-        sampling_timesteps = None,
         schedule_fn_kwargs = dict(),
         ddim_sampling_eta = 0.,
+        immiscible = False
         # min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556  # TODO
         # min_snr_gamma = 5,
-        immiscible = False
     ):
         self.model, self.time_embedding = build_model(cfg['model'])
-    
         if cfg['ema']:
             self.ema_model = copy.deepcopy(self.model)
             self.ema_decay = cfg['ema_decay']
@@ -57,7 +56,7 @@ class DDPMEngine:
         self.offset_noise_strength = cfg['offset_noise_strength']
         self.image_size = cfg['image_size']
         self.timesteps = cfg['timesteps']
-        self.self_cond = cfg['self_condition']
+        self.self_cond = cfg['model']['model_params']['self_condition']
         self.loss_weight = cfg['min_snr_loss_weight']
         self.input_range = cfg['input_range']
         self.prediction_type = cfg['prediction_type']
@@ -66,9 +65,9 @@ class DDPMEngine:
             raise NotImplementedError('min_snr_loss_weight is not supported yet')
         
         if self.input_range[0] != 0 or self.input_range[1] != 1 or self.input_range[0] > self.input_range[1] != 1:
-            self.normalizer = Scaler(self.input_range)
+            self.scaler = Scaler(self.input_range)
         else:
-            self.normalizer = IdentityScaler()
+            self.scaler = IdentityScaler()
         
         betas = get_beta_scheduler(cfg['beta_scheduler'])(self.timesteps, **schedule_fn_kwargs)
         alphas = 1. - betas
@@ -84,11 +83,11 @@ class DDPMEngine:
         self.betas_tilda = betas * (1. - alphas_bar_prev) / (1. - alphas_bar)
         self.log_betas_tilda = torch.log(self.betas_tilda.clamp(min =1e-20))
     
-        self.sampling_timesteps = sampling_timesteps if sampling_timesteps is not None else self.timesteps
+        self.sampling_timesteps = cfg['sampling_timesteps'] if cfg['sampling_timesteps'] is not None else self.timesteps
         
         assert self.sampling_timesteps <= self.timesteps, 'sampling timesteps cannot be greater than total timesteps'
 
-        self.metric_calculator = MetricCalculator(device=self.device, **cfg['metrics'])
+        self.metric_calculator = MetricCalculator(device=self.device, dataparallel=cfg['model']['dataparallel'], **cfg['metrics'])
 
     def train(self, cfg, train_dataset, verbose=True):
         train_dataloader = torch.utils.data.DataLoader(train_dataset, 
@@ -97,13 +96,14 @@ class DDPMEngine:
                                                        drop_last=True,
                                                        num_workers=cfg['num_workers'])
         test_dataloader = torch.utils.data.DataLoader(train_dataset,
-                                                        batch_size=cfg['batch_size'],
+                                                        batch_size=cfg['batch_size'] * 4,    # need less memory
                                                         shuffle=False,
                                                         drop_last=False,
                                                         num_workers=cfg['num_workers'])
-        epochs = range(cfg['num_epochs'])
-                    
+        
+        epochs = range(cfg['num_epochs'])            
         for epoch in epochs:
+            # train one epoch
             train_loss, elapsed_time = self.train_one_epoch(train_dataloader, verbose=False, log_interval=cfg['log_interval'])
             
             print(f"{epoch+1} / {cfg['num_epochs']} Train Loss", end=" ")
@@ -115,7 +115,7 @@ class DDPMEngine:
             
             # evaluate
             if (epoch+1) % cfg['eval_interval'] == 0: 
-                out, _ = self.p_sample([25, 3, 32, 32])
+                out, _ = self.p_sample([25] + self.image_size)
                 save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
                 
                 # n_samples = len(train_dataset)
@@ -132,11 +132,12 @@ class DDPMEngine:
             # TODO tensorboard logging...
             # if self.writer is not None:
                 # self.writer.add_scalar("Train Loss", train_loss, epoch)
-                            
+                           
+            # save checkpoints 
             if (epoch+1) % cfg['save_interval'] == 0:
                 ckpt = {
-                    'diffusion': self.model.state_dict(),
-                    'ema_model': self.ema_model.state_dict() if self.ema else None,
+                    'diffusion': get_model_state_dict(self.model),
+                    'ema_model': get_model_state_dict(self.ema_model) if self.ema else None,
                     'time_embedding': self.time_embedding.state_dict(),
                     'optimizer': self.optimizer.state_dict(),
                     'scheduler': self.scheduler.state_dict(),
@@ -155,80 +156,7 @@ class DDPMEngine:
                                  epoch=epoch+1,
                                  train_loss=train_loss,
                                  val_loss=None)
-        
-    def evaluate(self, n_samples, batch_size, test_dl, fid_stats_dir=None, verbose=False):
-        sampled_images = []
-        ret = {
-            'FID': None
-        }
-        
-        s = time.time()
-        if verbose:
-            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Sampling...')
-        else:
-            sample_iter = range(0, n_samples, batch_size)
-            
-        for b in sample_iter:
-            out, _ = self.p_sample([batch_size, 3, 32, 32], verbose=False)
-            sampled_images.append(out)
-        sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x 32 x 32
-        
-        sample_dl = torch.chunk(sampled_images, batch_size, dim=0)
-        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, verbose=verbose)
-        ret['FID'] = fid_score
-        
-        return ret, time.time() - s
 
-    def run_network(self, x, time_step, self_cond=None, use_ema=False):
-        """
-            Run unet network. predict mean
-        """
-        # TODO: cond
-        if self_cond is not None:
-            self_cond = self_cond.float()
-            
-        time_emb = self.time_embedding(time_step)
-        
-        if use_ema:
-            pred = self.ema_model(x.float(), time_emb, x_self_cond=self_cond)
-        else:
-            pred = self.model(x.float(), time_emb, x_self_cond=self_cond)
-        # pred = self.model(x.float(), time_step)
-        
-        return pred
-    
-    def postprocessing(self, pred, xt, time_steps, clip_x0=True):
-        # 3 modes
-        ret = {
-            'x0': None,
-            'noise': None
-        }
-         
-        # 1. predict noise
-        # following DDPM / predict noise (mean)
-        # https://arxiv.org/abs/2006.11239
-        if self.prediction_type == 'noise':
-            ret['x0'] = noise_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.sqrt_one_minus_alphas_bar[time_steps])
-            ret['noise'] = pred
-        
-        # 2. predict velocity
-        # following ... ?
-        # https://arxiv.org/pdf/2202.00512
-        elif self.prediction_type == 'velocity':
-            ret['x0'] = velocity_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-            ret['noise'] = x0_to_noise(ret['x0'], xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-            
-        # 3. predict x0
-        # following DDIM?
-        elif self.prediction_type == 'x0':
-            ret['x0'] = pred
-            ret['noise'] = x0_to_noise(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-        
-        if clip_x0:
-            ret['x0'] = ret['x0'].clamp(self.input_range[0], self.input_range[1])
-            
-        return ret
-    
     def train_one_epoch(self, dataloader, verbose=True, log_interval=10):
         if verbose:
             dataloader = tqdm(dataloader, ncols=100, desc='Training...')
@@ -243,7 +171,7 @@ class DDPMEngine:
             
             # B x 3 x H x W
             x0 = x0.to(self.device)
-            x0 = self.normalizer.normalize(x0)
+            x0 = self.scaler.normalize(x0)
             # cls = cls.to(self.device) # available only class guidance is used
             time_steps = time_steps.to(self.device)
             
@@ -297,11 +225,83 @@ class DDPMEngine:
             if self.verbose and ((iter+1) % log_interval == 0):
                 print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
                 si = time.time()
-                # break
-            
-            # break
-            
+
         return total_loss / n_iter, time.time() - s
+    
+
+    def evaluate(self, n_samples, batch_size, test_dl, fid_stats_dir=None, verbose=False):
+        sampled_images = []
+        ret = {
+            'FID': None
+        }
+        
+        s = time.time()
+        if verbose:
+            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Sampling...')
+        else:
+            sample_iter = range(0, n_samples, batch_size)
+            
+        for b in sample_iter:
+            out, _ = self.p_sample([batch_size] + self.image_size, verbose=False)
+            sampled_images.append(out)
+        sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x H x W
+        
+        sample_dl = torch.chunk(sampled_images, batch_size, dim=0)
+        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, verbose=verbose)
+        ret['FID'] = fid_score
+        
+        return ret, time.time() - s
+
+    def run_network(self, x, time_step, self_cond=None, use_ema=False):
+        """
+            Run unet network. predict mean
+        """
+        # TODO: cond
+        if self_cond is not None:
+            self_cond = self_cond.float()
+            
+        time_emb = self.time_embedding(time_step)
+        
+        if use_ema:
+            pred = self.ema_model(x.float(), time_emb, x_self_cond=self_cond)
+        else:
+            pred = self.model(x.float(), time_emb, x_self_cond=self_cond)
+        
+        return pred
+    
+    def postprocessing(self, pred, xt, time_steps, clip_x0=True):
+        # 3 modes
+        ret = {
+            'x0': None,
+            'noise': None
+        }
+         
+        # 1. predict noise
+        # following DDPM / predict noise (mean)
+        # https://arxiv.org/abs/2006.11239
+        if self.prediction_type == 'noise':
+            ret['x0'] = noise_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.sqrt_one_minus_alphas_bar[time_steps])
+            ret['noise'] = pred
+        
+        # 2. predict velocity
+        # following ... ?
+        # https://arxiv.org/pdf/2202.00512
+        elif self.prediction_type == 'velocity':
+            raise NotImplementedError('No QA for velocity prediction')
+            ret['x0'] = velocity_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+            ret['noise'] = x0_to_noise(ret['x0'], xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+            
+        # 3. predict x0
+        # following DDIM?
+        elif self.prediction_type == 'x0':
+            raise NotImplementedError('No QA for x0 prediction')
+            ret['x0'] = pred
+            ret['noise'] = x0_to_noise(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
+        
+        if clip_x0:
+            ret['x0'] = ret['x0'].clamp(self.input_range[0], self.input_range[1])
+            
+        return ret
     
     def ddim_sample(self,):
         pass
@@ -319,6 +319,8 @@ class DDPMEngine:
     def p_sample(self, sample_shape=None, return_trajectory=False, verbose=True):
         self.model.eval()
         self.time_embedding.eval()
+        if self.ema:
+            self.ema_model.eval()
 
         ret = []
         
@@ -342,8 +344,10 @@ class DDPMEngine:
                 
         self.model.train()
         self.time_embedding.train()
+        if self.ema:
+            self.ema_model.train()
 
-        return self.normalizer.unnormalize(xt.cpu()), ret
+        return self.scaler.unnormalize(xt.cpu()), ret
     
     @torch.no_grad()
     def _p_sample_iter(self, xt, t, self_cond, clip_x0=True):
@@ -389,12 +393,21 @@ class DDPMEngine:
         
         return self
     
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, dataparallel=False):
         ckpt = state_dict['checkpoint']
-        self.model.load_state_dict(ckpt['diffusion'])
-        self.ema_model.load_state_dict(ckpt['ema_model'])
-        self.time_embedding.load_state_dict(ckpt['time_embedding'])
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.scheduler.load_state_dict(ckpt['scheduler'])
+        
+        if dataparallel:
+            print("Loading state dict for DataParallel model")
+            self.model.module.load_state_dict(ckpt['diffusion'])
+            self.time_embedding.module.load_state_dict(ckpt['time_embedding'])
+            if self.ema:
+                self.ema_model.module.load_state_dict(ckpt['ema_model'])
+        else:
+            self.model.load_state_dict(ckpt['diffusion'])
+            self.time_embedding.load_state_dict(ckpt['time_embedding'])
+            if self.ema:
+                self.ema_model.load_state_dict(ckpt['ema_model'])
         
         print(f"Loaded state dict from epoch {state_dict['epoch']}")

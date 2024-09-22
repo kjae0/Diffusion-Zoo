@@ -2,6 +2,7 @@ from pytorch_fid.inception import InceptionV3
 from pytorch_fid.fid_score import calculate_frechet_distance
 from tqdm import tqdm
 
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -12,6 +13,7 @@ class MetricCalculator:
                  inception_block_idx=2048, 
                  cache_fid_stats=True,
                  cache_dir="./fid_stats.pth",
+                 dataparallel=False,
                  device=None):
         self.max_pixel_value = max_pixel_value
         self.device = device
@@ -22,11 +24,12 @@ class MetricCalculator:
         assert inception_block_idx in InceptionV3.BLOCK_INDEX_BY_DIM
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
         self.inception_v3 = InceptionV3([block_idx])
+        if dataparallel:
+            self.inception_v3 = torch.nn.DataParallel(self.inception_v3)
         self.fid_stats = {
             'mean': None,
             'cov': None
         }
-        
         
     def mse(self, image_gen, image_real):
         image_gen = image_gen.float()
@@ -83,7 +86,7 @@ class MetricCalculator:
         return mean, cov
     
     def _get_fid_stats(self, fid_stat_dir, image_real, device, verbose=False):
-        if fid_stat_dir:
+        if fid_stat_dir and os.path.exists(fid_stat_dir):
             self.fid_stats = torch.load(fid_stat_dir)
             print("FID statistics loaded from", fid_stat_dir)
             # print("Mean:", self.fid_stats['mean'].shape)
@@ -93,7 +96,8 @@ class MetricCalculator:
             self.fid_stats['cov'] = cov
             
             if self.cache_fid_stats:
-                torch.save(self.fid_stats, self.cache_dir)
+                cache_name = fid_stat_dir if fid_stat_dir else self.cache_dir
+                torch.save(self.fid_stats, cache_name)
     
     @torch.no_grad()
     def fid(self, image_gen_loader, image_real_loader=None, fid_stat_dir=None, verbose=False):
