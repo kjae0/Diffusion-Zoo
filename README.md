@@ -17,7 +17,7 @@ This repository aims to simplify NeRF, making it easily customizable and highly 
 ## Pretrained Weights
 | Model Name | Dataset | FID | IS | Weights |
 |-|-|-|-|-|
-| DDPM | CIFAR-10 | 2.94 | | Nan [Download](https://drive.google.com/file/d/1pVVhg2GQzUz1KWHuv1VczGD6gA9zQuI_/view?usp=drive_link) |
+| DDPM | CIFAR-10 | 2.94 | Nan | [Download](https://drive.google.com/file/d/1pVVhg2GQzUz1KWHuv1VczGD6gA9zQuI_/view?usp=drive_link) |
 | DDPM | Celeb-A | Nan | Nan | [Download](https://drive.google.com/file/d/1wOw1jAY1qMEiUVBbjOcBQgm_RNJ61Rp6/view?usp=drive_link) |
 
 ## Examples
