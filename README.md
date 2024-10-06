@@ -29,6 +29,7 @@ This repository aims to simplify NeRF, making it easily customizable and highly 
 ### <center> Classifier-Free Guidance </center>
 | CIFAR-10 | Celeb-A |
 |-|-|
-|   |   |
+| ![30_images](https://github.com/user-attachments/assets/51525d13-1d02-481a-aff9-751b2df01a7a) |   |
+| Trucks |   |
 COMING SOON!
 
