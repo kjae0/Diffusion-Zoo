@@ -2,7 +2,7 @@ import os
 import sys
 sys.path.append("/home/diya/Public/Image2Smiles/jy/Diffusion-Zoo")
 
-from diffusion.engines import ddpm
+from diffusion.engines import ddpm, classifier_free_guidance
 from datasets import build_dataset
 
 import yaml
@@ -13,6 +13,7 @@ import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg_dir", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--training_contd", type=str, default="")
     args = parser.parse_args()
     
@@ -32,7 +33,12 @@ if __name__ == "__main__":
         yaml.dump(cfg, f)
     
     # build engine
-    engine = ddpm.DDPMEngine(cfg)
+    if args.model == "ddpm":
+        print("Building DDPM engine...")
+        engine = ddpm.DDPMEngine(cfg)
+    elif args.model == "cfg":
+        print("Building Classifier Free Guidance engine...")
+        engine = classifier_free_guidance.CFGEngine(cfg)
     engine.to(cfg['device'])
     
     # build dataset

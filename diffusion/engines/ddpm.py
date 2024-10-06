@@ -6,7 +6,6 @@ from diffusion.utils import shape_matcher_1d, ema
 from diffusion.utils import x0_to_noise, noise_to_x0, velocity_to_x0
 from diffusion.utils import get_model_state_dict
 from diffusion.metrics import MetricCalculator
-from diffusion.models import unet_test
 
 from src.utils import save_images_grid
 
@@ -28,8 +27,6 @@ class DDPMEngine:
         self,
         cfg,
         schedule_fn_kwargs = dict(),
-        ddim_sampling_eta = 0.,
-        immiscible = False
         # min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556  # TODO
         # min_snr_gamma = 5,
     ):
@@ -60,6 +57,7 @@ class DDPMEngine:
         self.loss_weight = cfg['min_snr_loss_weight']
         self.input_range = cfg['input_range']
         self.prediction_type = cfg['prediction_type']
+        self.ddim_sampling_eta = cfg['ddim_sampling_eta']
         
         if self.loss_weight:
             raise NotImplementedError('min_snr_loss_weight is not supported yet')
@@ -71,20 +69,19 @@ class DDPMEngine:
         
         betas = get_beta_scheduler(cfg['beta_scheduler'])(self.timesteps, **schedule_fn_kwargs)
         alphas = 1. - betas
-        alphas_bar = torch.cumprod(alphas, dim=0)
-        alphas_bar_prev = F.pad(alphas_bar[:-1], (1, 0), value=1.)
+        self.alphas_bar = torch.cumprod(alphas, dim=0)
+        self.alphas_bar_prev = F.pad(self.alphas_bar[:-1], (1, 0), value=1.)
         
         # predefine those for reduce repetitive computation
-        self.one_minus_alphas_bar = 1. - alphas_bar
-        self.sqrt_alphas_bar = torch.sqrt(alphas_bar)
-        self.sqrt_one_minus_alphas_bar = torch.sqrt(1. - alphas_bar)
-        self.p_sampling_coef_x0 = betas * torch.sqrt(alphas_bar_prev) / (1. - alphas_bar)
-        self.p_sampling_coef_xt = torch.sqrt(alphas) * (1. - alphas_bar_prev) / (1. - alphas_bar)
-        self.betas_tilda = betas * (1. - alphas_bar_prev) / (1. - alphas_bar)
+        self.one_minus_alphas_bar = 1. - self.alphas_bar
+        self.sqrt_alphas_bar = torch.sqrt(self.alphas_bar)
+        self.sqrt_one_minus_alphas_bar = torch.sqrt(1. - self.alphas_bar)
+        self.p_sampling_coef_x0 = betas * torch.sqrt(self.alphas_bar_prev) / (1. - self.alphas_bar)
+        self.p_sampling_coef_xt = torch.sqrt(alphas) * (1. - self.alphas_bar_prev) / (1. - self.alphas_bar)
+        self.betas_tilda = betas * (1. - self.alphas_bar_prev) / (1. - self.alphas_bar)
         self.log_betas_tilda = torch.log(self.betas_tilda.clamp(min =1e-20))
     
         self.sampling_timesteps = cfg['sampling_timesteps'] if cfg['sampling_timesteps'] is not None else self.timesteps
-        
         assert self.sampling_timesteps <= self.timesteps, 'sampling timesteps cannot be greater than total timesteps'
 
         self.metric_calculator = MetricCalculator(device=self.device, dataparallel=cfg['model']['dataparallel'], **cfg['metrics'])
@@ -114,10 +111,11 @@ class DDPMEngine:
                 self.scheduler.step()
             
             # evaluate
-            if (epoch+1) % cfg['eval_interval'] == 0: 
-                out, _ = self.p_sample([25] + self.image_size)
+            if (epoch+1) % cfg['vis_interval'] == 0: 
+                out, _ = self.p_sample(sample_shape=[25] + self.image_size)
                 save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
-                
+            
+            if (epoch+1) % cfg['eval_interval'] == 0: 
                 # n_samples = len(train_dataset)
                 n_samples = cfg['n_eval_samples']
                 fid_stats_dir = cfg['fid_stats_dir'] if 'fid_stats_dir' in cfg else None
@@ -242,7 +240,7 @@ class DDPMEngine:
             sample_iter = range(0, n_samples, batch_size)
             
         for b in sample_iter:
-            out, _ = self.p_sample([batch_size] + self.image_size, verbose=False)
+            out, _ = self.ddim_sample(sample_shape=[batch_size] + self.image_size)
             sampled_images.append(out)
         sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x H x W
         
@@ -253,10 +251,6 @@ class DDPMEngine:
         return ret, time.time() - s
 
     def run_network(self, x, time_step, self_cond=None, use_ema=False):
-        """
-            Run unet network. predict mean
-        """
-        # TODO: cond
         if self_cond is not None:
             self_cond = self_cond.float()
             
@@ -303,9 +297,6 @@ class DDPMEngine:
             
         return ret
     
-    def ddim_sample(self,):
-        pass
-    
     def q_sample(self, x0, noise, time_steps):
         # TODO immiscrible
         
@@ -314,6 +305,77 @@ class DDPMEngine:
             shape_matcher_1d(self.sqrt_one_minus_alphas_bar[time_steps], noise.shape) * noise
             
         return noised
+    
+    @torch.no_grad()
+    def ddim_sample(self, sample_shape=None, return_trajectory=False, clip_x0=True, eta=None):
+        self.model.eval()
+        self.time_embedding.eval()
+        if self.ema:
+            self.ema_model.eval()
+
+        ret = []
+        
+        eta = eta if eta is not None else self.ddim_sampling_eta
+        sample_shape = self.image_size if sample_shape is None else sample_shape
+        
+        xT = torch.randn(sample_shape).to(self.device)
+        times = torch.linspace(-1, self.timesteps - 1, steps=self.sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+        xt = xT
+        self_cond = None
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):                
+            out = self.ddim_sample_iter(xt, time, time_next, self_cond, clip_x0, eta=eta)
+            xt = out['x_t-1']
+            self_cond = out['x0']
+            
+            if return_trajectory:
+                ret.append(xt.cpu())
+                
+        self.model.train()
+        self.time_embedding.train()
+        if self.ema:
+            self.ema_model.train()
+
+        return self.scaler.unnormalize(xt.cpu()), ret
+    
+    @torch.no_grad()
+    def ddim_sample_iter(self, xt, t, t_next, self_cond, clip_x0=True, eta=None):
+        assert len(xt.shape) == 4, 'input shape must be B x C x H x W'
+        
+        eta = eta if eta is not None else self.ddim_sampling_eta
+        
+        ret = {'x_t-1': None,
+               'x0': None}
+        
+        B = xt.shape[0]
+        batch_t = torch.full((B,), t, device=self.device, dtype=torch.long)    # B
+            
+        pred = self.run_network(xt, batch_t, self_cond, use_ema=self.ema)
+        pred = self.postprocessing(pred, xt, batch_t, clip_x0)        
+
+        if t_next < 0:
+            return {
+                'x0': pred['x0'],
+                'x_t-1': pred['x0']
+            }
+
+        alpha = self.alphas_bar[t]
+        alpha_next = self.alphas_bar[t_next]
+
+        sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+        c = (1 - alpha_next - sigma ** 2).sqrt()
+
+        noise = torch.randn_like(xt)
+
+        ret['x_t-1'] = pred['x0'] * alpha_next.sqrt() + \
+                c * pred['noise'] + \
+                sigma * noise
+        ret['x0'] = pred['x0']
+
+        return ret
     
     @torch.no_grad()
     def p_sample(self, sample_shape=None, return_trajectory=False, verbose=True):
@@ -325,7 +387,6 @@ class DDPMEngine:
         ret = []
         
         sample_shape = self.image_size if sample_shape is None else sample_shape
-        
         xT = torch.randn(sample_shape).to(self.device)
         
         time_steps = reversed(range(self.sampling_timesteps))

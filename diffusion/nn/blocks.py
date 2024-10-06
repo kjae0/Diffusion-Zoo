@@ -63,7 +63,7 @@ class Conv2dBlock(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, time_emb_dim = None, dropout = 0.):
+    def __init__(self, in_dim, out_dim, time_emb_dim=None, dropout = 0.):
         super().__init__()
         
         if time_emb_dim:
@@ -87,11 +87,14 @@ class ResnetBlock(nn.Module):
             nn.init.kaiming_normal_(self.res_conv.weight)
             nn.init.zeros_(self.res_conv.bias)
 
-    def forward(self, x, time_emb = None):
+    def forward(self, x, time_emb=None, class_emb=None):
         scale_shift = None
         
         if self.mlp:
             assert time_emb is not None, 'time embedding must be given'
+            
+            if class_emb is not None:
+                time_emb = torch.cat((time_emb, class_emb), dim=-1)
             
             time_emb = self.mlp(time_emb).unsqueeze(-1).unsqueeze(-1)
             scale_shift = time_emb.chunk(2, dim = 1) 
