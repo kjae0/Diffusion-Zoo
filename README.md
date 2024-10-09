@@ -18,7 +18,8 @@ This repository aims to simplify NeRF, making it easily customizable and highly 
 | Model Name | Dataset | FID | IS | Weights |
 |-|-|-|-|-|
 | DDPM | CIFAR-10 | 2.94 | Nan | [Download](https://drive.google.com/file/d/1pVVhg2GQzUz1KWHuv1VczGD6gA9zQuI_/view?usp=drive_link) |
-| DDPM | Celeb-A | Nan | Nan | [Download](https://drive.google.com/file/d/1wOw1jAY1qMEiUVBbjOcBQgm_RNJ61Rp6/view?usp=drive_link) |
+| DDPM | Celeb-A | 4.55 | Nan | [Download](https://drive.google.com/file/d/1wOw1jAY1qMEiUVBbjOcBQgm_RNJ61Rp6/view?usp=drive_link) |
+| CFG | CIFAR-10 | 2.94 | Nan | [Download](https://drive.google.com/file/d/1pVVhg2GQzUz1KWHuv1VczGD6gA9zQuI_/view?usp=drive_link) |
 
 ## Examples
 ### <center> DDPM </center>
@@ -29,7 +30,8 @@ This repository aims to simplify NeRF, making it easily customizable and highly 
 ### <center> Classifier-Free Guidance </center>
 | CIFAR-10 | Celeb-A |
 |-|-|
-| ![30_images](https://github.com/user-attachments/assets/62a555d5-66f1-4b42-a4c9-c8dabfa331a6) |   |
+| ![930_images](https://github.com/user-attachments/assets/229b1f89-e6a8-40b2-b1ec-d0b12b4faddd)
+ |   |
 | Trucks |   |
 COMING SOON!
 
