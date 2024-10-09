@@ -4,7 +4,7 @@
 Pytorch implementation of Diffusion models.<br>
 Pretrained weights are provided through GoogleDrive.
 
-This repository aims to simplify NeRF, making it easily customizable and highly extensible.<br>
+This repository aims to simplify Diffusion, easy to customize!<br>
 
 ## TODO
 - [x] DDPM <br>
