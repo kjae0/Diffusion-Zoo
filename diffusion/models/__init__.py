@@ -14,7 +14,7 @@ def build_model(cfg):
     else:
         raise NotImplementedError(f"Time embedding {cfg['time_emb']['name']} is not implemented")
     
-    if cfg['dataparallel']:
+    if cfg.get('dataparallel', False):
         model = nn.DataParallel(model)
         time_emb = nn.DataParallel(time_emb)
     

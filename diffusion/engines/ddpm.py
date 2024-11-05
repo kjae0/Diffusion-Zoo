@@ -4,7 +4,7 @@ from diffusion.utils import save_checkpoints, get_learning_rate
 from diffusion.utils import shape_matcher_1d, ema
 from diffusion.utils import get_model_state_dict
 from diffusion.metrics import MetricCalculator
-from datasets import build_dataset
+from diffusion_datasets import build_dataset
 
 from diffusion.utils import (
     x0_to_noise, 
@@ -50,12 +50,12 @@ class DDPMEngine:
         model_size = 0
         for param in self.model.parameters():
             model_size += param.data.nelement()
-        print('[INFO] Model params: %.2f M' % (model_size / 1024 / 1024))
         
         self.loss_fn = build_loss_fn(cfg['loss'])
         self.optimizer = build_optimizer(cfg['optimizer'], self.model.parameters())
         self.scheduler = build_scheduler(cfg['scheduler'], self.optimizer)
         self.dataset = build_dataset(cfg['dataset'])
+        print('[INFO] Model params: %.2f M' % (model_size / 1024 / 1024))
         
         self.device = cfg['device']
         self.verbose = cfg['verbose']

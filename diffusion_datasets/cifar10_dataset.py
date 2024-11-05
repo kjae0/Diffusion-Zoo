@@ -1,6 +1,6 @@
 import sys
 sys.path.append('..')
-from datasets.transforms import get_transform
+from diffusion_datasets.transforms import get_transform
 
 from torch.utils.data import Dataset
 from torchvision.transforms import transforms

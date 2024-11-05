@@ -1,6 +1,6 @@
 import os
 import sys
-sys.path.append("/home/diya/Public/Image2Smiles/jy/Diffusion-Zoo")
+sys.path.append("./")
 
 from diffusion.engines import ddpm, classifier_free_guidance
 
@@ -9,10 +9,15 @@ import time
 import torch
 import argparse
 
+# TODO wandb
+
+import tensorboardX
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cfg_dir", type=str, required=True)
     parser.add_argument("--model", type=str, required=True)
+    parser.add_argument("--enable_writer", default=False, action='store_true')
     parser.add_argument("--training_contd", type=str, default="")
     args = parser.parse_args()
     
@@ -30,14 +35,17 @@ if __name__ == "__main__":
     # for check config of ckpt
     with open(os.path.join(cfg['train']['ckpt_dir'], "config.yaml"), "w") as f:
         yaml.dump(cfg, f)
+        
+    if args.enable_writer:
+        writer = tensorboardX.SummaryWriter(cfg['train']['ckpt_dir'])
     
     # build engine
     if args.model == "ddpm":
         print("Building DDPM engine...")
-        engine = ddpm.DDPMEngine(cfg)
+        engine = ddpm.DDPMEngine(cfg, writer=writer)
     elif args.model == "cfg":
         print("Building Classifier Free Guidance engine...")
-        engine = classifier_free_guidance.CFGEngine(cfg)
+        engine = classifier_free_guidance.CFGEngine(cfg, writer=writer)
     engine.to(cfg['device'])
     
     # if you continue training

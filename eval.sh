@@ -1,2 +1,0 @@
-CUDA_VISIBLE_DEVICES="0,1,2" python ./src/eval.py --model cfg --batch_size 600 --ckpt_dir /home/diya/Public/Image2Smiles/jy/Diffusion-Zoo/ckpts/cfg_ema_wide_cifar10_20241006-122415 --dset cifar10
-# CUDA_VISIBLE_DEVICES="0,1,2" python ./src/eval.py --model ddpm --batch_size 150 --ckpt_dir /home/diya/Public/Image2Smiles/jy/Diffusion-Zoo/ckpts/ddpm_ema_wide_celeba_20240922-123800 --dset celeba

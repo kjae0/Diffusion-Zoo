@@ -4,7 +4,7 @@ import argparse
 import yaml
 import torch
 
-sys.path.append("/home/diya/Public/Image2Smiles/jy/Diffusion-Zoo")
+sys.path.append("./")
 
 from tqdm import tqdm
 from diffusion.utils import remove_module_from_state_dict

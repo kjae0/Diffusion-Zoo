@@ -1,9 +1,9 @@
 import sys
 sys.path.append('..')
 
-from datasets.transforms import get_transform
-from datasets.cifar10_dataset import CIFAR10Dataset
-from datasets.celeba_dataset import CelebADataset
+from diffusion_datasets.transforms import get_transform
+from diffusion_datasets.cifar10_dataset import CIFAR10Dataset
+from diffusion_datasets.celeba_dataset import CelebADataset
 
 def build_dataset(cfg):
     if cfg['name'] == 'cifar10':

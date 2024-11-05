@@ -24,3 +24,4 @@
 /ckpts/*
 /__pycache__/*
 /out_logs/*
+*.sh
