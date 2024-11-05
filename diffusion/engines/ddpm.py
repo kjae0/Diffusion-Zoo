@@ -1,11 +1,20 @@
 from diffusion.models import build_model
 from diffusion.utils import get_beta_scheduler, Scaler, IdentityScaler
-from diffusion.utils import build_loss_fn, build_optimizer, build_scheduler
 from diffusion.utils import save_checkpoints, get_learning_rate
 from diffusion.utils import shape_matcher_1d, ema
-from diffusion.utils import x0_to_noise, noise_to_x0, velocity_to_x0
 from diffusion.utils import get_model_state_dict
 from diffusion.metrics import MetricCalculator
+from datasets import build_dataset
+
+from diffusion.utils import (
+    x0_to_noise, 
+    noise_to_x0, 
+    velocity_to_x0)
+from diffusion.utils import (
+    build_loss_fn, 
+    build_optimizer, 
+    build_scheduler, 
+)
 
 from src.utils import save_images_grid
 
@@ -26,11 +35,11 @@ class DDPMEngine:
     def __init__(
         self,
         cfg,
-        schedule_fn_kwargs = dict(),
-        # min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556  # TODO
-        # min_snr_gamma = 5,
+        writer=None
     ):
         self.model, self.time_embedding = build_model(cfg['model'])
+        self.writer = writer
+        
         if cfg['ema']:
             self.ema_model = copy.deepcopy(self.model)
             self.ema_decay = cfg['ema_decay']
@@ -41,11 +50,12 @@ class DDPMEngine:
         model_size = 0
         for param in self.model.parameters():
             model_size += param.data.nelement()
-        print('Model params: %.2f M' % (model_size / 1024 / 1024))
+        print('[INFO] Model params: %.2f M' % (model_size / 1024 / 1024))
         
         self.loss_fn = build_loss_fn(cfg['loss'])
         self.optimizer = build_optimizer(cfg['optimizer'], self.model.parameters())
         self.scheduler = build_scheduler(cfg['scheduler'], self.optimizer)
+        self.dataset = build_dataset(cfg['dataset'])
         
         self.device = cfg['device']
         self.verbose = cfg['verbose']
@@ -67,12 +77,12 @@ class DDPMEngine:
         else:
             self.scaler = IdentityScaler()
         
-        betas = get_beta_scheduler(cfg['beta_scheduler'])(self.timesteps, **schedule_fn_kwargs)
+        betas = get_beta_scheduler(cfg['beta_scheduler'])(self.timesteps)
         alphas = 1. - betas
-        self.alphas_bar = torch.cumprod(alphas, dim=0)
-        self.alphas_bar_prev = F.pad(self.alphas_bar[:-1], (1, 0), value=1.)
         
         # predefine those for reduce repetitive computation
+        self.alphas_bar = torch.cumprod(alphas, dim=0)
+        self.alphas_bar_prev = F.pad(self.alphas_bar[:-1], (1, 0), value=1.)
         self.one_minus_alphas_bar = 1. - self.alphas_bar
         self.sqrt_alphas_bar = torch.sqrt(self.alphas_bar)
         self.sqrt_one_minus_alphas_bar = torch.sqrt(1. - self.alphas_bar)
@@ -86,13 +96,29 @@ class DDPMEngine:
 
         self.metric_calculator = MetricCalculator(device=self.device, dataparallel=cfg['model']['dataparallel'], **cfg['metrics'])
 
-    def train(self, cfg, train_dataset, verbose=True):
+    def run_network(self, x, time_step, self_cond=None, use_ema=False):
+        if self_cond is not None:
+            self_cond = self_cond.float()
+            
+        time_emb = self.time_embedding(time_step)
+        
+        if use_ema:
+            pred = self.ema_model(x.float(), time_emb, x_self_cond=self_cond)
+        else:
+            pred = self.model(x.float(), time_emb, x_self_cond=self_cond)
+        
+        return pred
+
+    def train(self, cfg):
+        train_dataset = self.dataset
+        test_dataset = self.dataset
+        
         train_dataloader = torch.utils.data.DataLoader(train_dataset, 
                                                        batch_size=cfg['batch_size'], 
                                                        shuffle=True, 
                                                        drop_last=True,
                                                        num_workers=cfg['num_workers'])
-        test_dataloader = torch.utils.data.DataLoader(train_dataset,
+        test_dataloader = torch.utils.data.DataLoader(test_dataset,
                                                         batch_size=cfg['batch_size'] * 4,    # need less memory
                                                         shuffle=False,
                                                         drop_last=False,
@@ -103,7 +129,7 @@ class DDPMEngine:
             # train one epoch
             train_loss, elapsed_time = self.train_one_epoch(train_dataloader, verbose=False, log_interval=cfg['log_interval'])
             
-            print(f"{epoch+1} / {cfg['num_epochs']} Train Loss", end=" ")
+            print(f"[INFO] {epoch+1} / {cfg['num_epochs']} Train Loss", end=" ")
             print(f"Train loss - {train_loss:6f}", end=" ")
             print(f"Time: {elapsed_time:2f} Lr: {get_learning_rate(self.optimizer)}")
             
@@ -114,9 +140,9 @@ class DDPMEngine:
             if (epoch+1) % cfg['vis_interval'] == 0: 
                 out, _ = self.p_sample(sample_shape=[25] + self.image_size)
                 save_images_grid(os.path.join(cfg['ckpt_dir'], f"{epoch+1}_images.png"), out)
+                print(f"[INFO] Saved images at {cfg['ckpt_dir']}")
             
             if (epoch+1) % cfg['eval_interval'] == 0: 
-                # n_samples = len(train_dataset)
                 n_samples = cfg['n_eval_samples']
                 fid_stats_dir = cfg['fid_stats_dir'] if 'fid_stats_dir' in cfg else None
                 
@@ -128,8 +154,13 @@ class DDPMEngine:
                 print(f"Time: {elapsed_time:2f}\n")                
             
             # TODO tensorboard logging...
-            # if self.writer is not None:
-                # self.writer.add_scalar("Train Loss", train_loss, epoch)
+            if self.writer is not None:
+                # add image
+                self.writer.add_image('train/image', out, epoch)
+                
+                # add eval result
+                for k, v in perf.items():
+                    self.writer.add_scalar(f'eval/{k}', v, epoch)
                            
             # save checkpoints 
             if (epoch+1) % cfg['save_interval'] == 0:
@@ -183,9 +214,6 @@ class DDPMEngine:
                 
             xt = self.q_sample(x0, noise, time_steps).float()
             
-            # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-            # and condition with unet with that
-            # this technique will slow down training by 25%, but seems to lower FID significantly
             x_self_cond = None
             if self.self_cond and random.random() < 0.5:
                 with torch.no_grad():
@@ -201,10 +229,6 @@ class DDPMEngine:
             # convert target following prediction type
             if self.prediction_type == 'noise':
                 loss = self.loss_fn(pred['noise'], noise)
-            elif self.prediction_type == 'velocity':
-                pass
-            elif self.prediction_type == 'x0':
-                pass
             else:
                 raise NotImplementedError(f"Prediction type {self.prediction_type} is not supported yet")
             
@@ -221,7 +245,7 @@ class DDPMEngine:
             n_iter += 1
             
             if self.verbose and ((iter+1) % log_interval == 0):
-                print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
+                print(f"[INFO] {iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
                 si = time.time()
 
         return total_loss / n_iter, time.time() - s
@@ -249,19 +273,6 @@ class DDPMEngine:
         ret['FID'] = fid_score
         
         return ret, time.time() - s
-
-    def run_network(self, x, time_step, self_cond=None, use_ema=False):
-        if self_cond is not None:
-            self_cond = self_cond.float()
-            
-        time_emb = self.time_embedding(time_step)
-        
-        if use_ema:
-            pred = self.ema_model(x.float(), time_emb, x_self_cond=self_cond)
-        else:
-            pred = self.model(x.float(), time_emb, x_self_cond=self_cond)
-        
-        return pred
     
     def postprocessing(self, pred, xt, time_steps, clip_x0=True):
         # 3 modes
@@ -276,30 +287,18 @@ class DDPMEngine:
         if self.prediction_type == 'noise':
             ret['x0'] = noise_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.sqrt_one_minus_alphas_bar[time_steps])
             ret['noise'] = pred
-        
         # 2. predict velocity
-        # following ... ?
-        # https://arxiv.org/pdf/2202.00512
         elif self.prediction_type == 'velocity':
             raise NotImplementedError('No QA for velocity prediction')
-            ret['x0'] = velocity_to_x0(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-            ret['noise'] = x0_to_noise(ret['x0'], xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-            
         # 3. predict x0
-        # following DDIM?
         elif self.prediction_type == 'x0':
             raise NotImplementedError('No QA for x0 prediction')
-            ret['x0'] = pred
-            ret['noise'] = x0_to_noise(pred, xt, self.sqrt_alphas_bar[time_steps], self.one_minus_alphas_bar[time_steps])
-        
         if clip_x0:
             ret['x0'] = ret['x0'].clamp(self.input_range[0], self.input_range[1])
             
         return ret
     
     def q_sample(self, x0, noise, time_steps):
-        # TODO immiscrible
-        
         # B x C x H x W
         noised = shape_matcher_1d(self.sqrt_alphas_bar[time_steps], x0.shape) * x0 + \
             shape_matcher_1d(self.sqrt_one_minus_alphas_bar[time_steps], noise.shape) * noise
@@ -307,7 +306,7 @@ class DDPMEngine:
         return noised
     
     @torch.no_grad()
-    def ddim_sample(self, sample_shape=None, return_trajectory=False, clip_x0=True, eta=None):
+    def ddim_sample(self, sample_shape=None, return_trajectory=False, clip_x0=True, eta=None, verbose=False):
         self.model.eval()
         self.time_embedding.eval()
         if self.ema:
@@ -326,7 +325,12 @@ class DDPMEngine:
         xt = xT
         self_cond = None
 
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):                
+        if verbose:
+            time_pairs = tqdm(time_pairs, ncols=100, desc='Sampling')
+        else:
+            time_pairs = time_pairs
+            
+        for time, time_next in time_pairs:                
             out = self.ddim_sample_iter(xt, time, time_next, self_cond, clip_x0, eta=eta)
             xt = out['x_t-1']
             self_cond = out['x0']
@@ -460,7 +464,7 @@ class DDPMEngine:
         self.scheduler.load_state_dict(ckpt['scheduler'])
         
         if dataparallel:
-            print("Loading state dict for DataParallel model")
+            print("[INFO] Loading state dict for DataParallel model")
             self.model.module.load_state_dict(ckpt['diffusion'])
             self.time_embedding.module.load_state_dict(ckpt['time_embedding'])
             if self.ema:
@@ -471,4 +475,4 @@ class DDPMEngine:
             if self.ema:
                 self.ema_model.load_state_dict(ckpt['ema_model'])
         
-        print(f"Loaded state dict from epoch {state_dict['epoch']}")
+        print(f"[INFO] Loaded state dict from epoch {state_dict['epoch']} successfully.")

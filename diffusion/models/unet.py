@@ -158,7 +158,7 @@ class UNet(nn.Module):
 
     def forward(self, x, time_emb, class_cond=None, class_cond_mask=None, x_self_cond=None):
         assert all([(d % self.downsample_factor) == 0 for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
-        assert not(class_cond is None or not self.class_condition), 'Class can be provided if and only if class_condition is True'
+        assert not(class_cond is not None and not self.class_condition), 'Class can be provided if and only if class_condition is True'
 
         if self.self_condition:
             if x_self_cond == None:

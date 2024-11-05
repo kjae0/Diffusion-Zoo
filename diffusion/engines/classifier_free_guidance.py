@@ -27,91 +27,16 @@ class CFGEngine(ddpm.DDPMEngine):
     def __init__(
         self,
         cfg,
-        schedule_fn_kwargs = dict(),
-        immiscible = False
-        # min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556  # TODO
-        # min_snr_gamma = 5,
+        writer=None
     ):
         if cfg['model']['model_params']['class_condition'] == False:
-            print('[CFGEngine] class_condition is False, setting to True')
+            print('[INFO] class_condition is False, setting to True')
             cfg['model']['model_params']['class_condition'] = True
         
         self.num_classes = cfg['model']['model_params']['num_classes']
         self.guidance_scale = cfg['guidance_scale']
-        super().__init__(cfg, schedule_fn_kwargs)
-        
-    def train_one_epoch(self, dataloader, verbose=True, log_interval=10):
-        if verbose:
-            dataloader = tqdm(dataloader, ncols=100, desc='Training...')
-        
-        total_loss = 0
-        n_iter = 0
-        s = time.time()
-        si = time.time()
-        for iter, (x0, cls) in enumerate(dataloader):
-            # B
-            time_steps = torch.randint(0, self.sampling_timesteps, (x0.shape[0],), device=self.device).long()
-            
-            # B x 3 x H x W
-            x0 = x0.to(self.device)
-            cls = cls.to(self.device)
-            x0 = self.scaler.normalize(x0)
-            # cls = cls.to(self.device) # available only class guidance is used
-            time_steps = time_steps.to(self.device)
-            
-            # B x 3 x H x W
-            noise = torch.randn_like(x0).to(self.device)
-            
-            # TODO offset noise strength
-            if self.offset_noise_strength > 0.:
-                offset_noise = torch.randn(x0.shape[:2], device = self.device) # B x C
-                noise += self.offset_noise_strength * offset_noise.unsqueeze(-1).unsqueeze(-1)
-                
-            xt = self.q_sample(x0, noise, time_steps).float()
-            
-            # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-            # and condition with unet with that
-            # this technique will slow down training by 25%, but seems to lower FID significantly
-            x_self_cond = None
-            if self.self_cond and random.random() < 0.5:
-                with torch.no_grad():
-                    pred = self.run_network(xt, cls, time_steps, self_cond=x_self_cond, use_ema=False)
-                    pred = self.postprocessing(pred, xt, time_steps)
-                    x_self_cond = pred['x0'].float().detach()
-            
-            # B x 3 x H x W
-            pred = self.run_network(xt, cls, time_steps, self_cond=x_self_cond, use_ema=False)
-            pred = self.postprocessing(pred, xt, time_steps)
-
-            # TODO
-            # convert target following prediction type
-            if self.prediction_type == 'noise':
-                loss = self.loss_fn(pred['noise'], noise)
-            elif self.prediction_type == 'velocity':
-                pass
-            elif self.prediction_type == 'x0':
-                pass
-            else:
-                raise NotImplementedError(f"Prediction type {self.prediction_type} is not supported yet")
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
-            self.optimizer.step()
-            
-            if self.ema:
-                ema(self.model, self.ema_model, self.ema_decay)
-
-            
-            total_loss += loss.item()
-            n_iter += 1
-            
-            if self.verbose and ((iter+1) % log_interval == 0):
-                print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
-                si = time.time()
-
-        return total_loss / n_iter, time.time() - s
-        
+        super().__init__(cfg)
+    
     def run_network(self, x, y, time_step, 
                     class_mask_prob=0.1, class_cond_scale=None,
                     self_cond=None, use_ema=False):
@@ -143,6 +68,93 @@ class CFGEngine(ddpm.DDPMEngine):
             pred = model(x.float(), time_emb, class_cond=y, class_cond_mask=class_cond_mask, x_self_cond=self_cond)
         
         return pred
+    
+    def train_one_epoch(self, dataloader, verbose=True, log_interval=10):
+        if verbose:
+            dataloader = tqdm(dataloader, ncols=100, desc='Training...')
+        
+        total_loss = 0
+        n_iter = 0
+        s = time.time()
+        si = time.time()
+        for iter, (x0, cls) in enumerate(dataloader):
+            # B
+            time_steps = torch.randint(0, self.sampling_timesteps, (x0.shape[0],), device=self.device).long()
+            
+            # B x 3 x H x W
+            x0 = x0.to(self.device)
+            cls = cls.to(self.device)
+            x0 = self.scaler.normalize(x0)
+            # cls = cls.to(self.device) # available only class guidance is used
+            time_steps = time_steps.to(self.device)
+            
+            # B x 3 x H x W
+            noise = torch.randn_like(x0).to(self.device)
+            
+            if self.offset_noise_strength > 0.:
+                offset_noise = torch.randn(x0.shape[:2], device = self.device) # B x C
+                noise += self.offset_noise_strength * offset_noise.unsqueeze(-1).unsqueeze(-1)
+                
+            xt = self.q_sample(x0, noise, time_steps).float()
+            
+            x_self_cond = None
+            if self.self_cond and random.random() < 0.5:
+                with torch.no_grad():
+                    pred = self.run_network(xt, cls, time_steps, self_cond=x_self_cond, use_ema=False)
+                    pred = self.postprocessing(pred, xt, time_steps)
+                    x_self_cond = pred['x0'].float().detach()
+            
+            # B x 3 x H x W
+            pred = self.run_network(xt, cls, time_steps, self_cond=x_self_cond, use_ema=False)
+            pred = self.postprocessing(pred, xt, time_steps)
+
+            # TODO
+            # convert target following prediction type
+            if self.prediction_type == 'noise':
+                loss = self.loss_fn(pred['noise'], noise)
+            else:
+                raise NotImplementedError(f"Prediction type {self.prediction_type} is not supported yet")
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            self.optimizer.step()
+            
+            if self.ema:
+                ema(self.model, self.ema_model, self.ema_decay)
+
+            total_loss += loss.item()
+            n_iter += 1
+            
+            if self.verbose and ((iter+1) % log_interval == 0):
+                print(f"{iter+1} / {len(dataloader)} Loss: ", loss.item(), f"Time Elapsed: {(time.time() - si):2f}")
+                si = time.time()
+
+        return total_loss / n_iter, time.time() - s
+    
+    def evaluate(self, n_samples, batch_size, test_dl, fid_stats_dir=None, verbose=False):
+        sampled_images = []
+        ret = {
+            'FID': None
+        }
+        
+        s = time.time()
+        if verbose:
+            sample_iter = tqdm(range(0, n_samples, batch_size), ncols=100, desc='Sampling...')
+        else:
+            sample_iter = range(0, n_samples, batch_size)
+            
+        class_cond = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
+        for b in sample_iter:
+            out, _ = self.ddim_sample(class_cond=class_cond, sample_shape=[batch_size] + self.image_size)
+            sampled_images.append(out)
+        sampled_images = torch.cat(sampled_images, dim=0)   # n_samples x 3 x H x W
+        
+        sample_dl = torch.chunk(sampled_images, batch_size, dim=0)
+        fid_score = self.metric_calculator.fid(sample_dl, test_dl, fid_stats_dir, verbose=verbose)
+        ret['FID'] = fid_score
+        
+        return ret, time.time() - s
     
     @torch.no_grad()
     def ddim_sample(self, class_cond=None, sample_shape=None, return_trajectory=False, clip_x0=True, eta=None):

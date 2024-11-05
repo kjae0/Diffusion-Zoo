@@ -3,7 +3,6 @@ import sys
 sys.path.append("/home/diya/Public/Image2Smiles/jy/Diffusion-Zoo")
 
 from diffusion.engines import ddpm, classifier_free_guidance
-from datasets import build_dataset
 
 import yaml
 import time
@@ -41,14 +40,11 @@ if __name__ == "__main__":
         engine = classifier_free_guidance.CFGEngine(cfg)
     engine.to(cfg['device'])
     
-    # build dataset
-    dset = build_dataset(cfg['dataset'])
-    
     # if you continue training
     if args.training_contd:
         state_dict = torch.load(args.training_contd)
         engine.load_state_dict(state_dict, dataparallel=cfg['model']['dataparallel'])
         
     # let's go!
-    engine.train(cfg['train'], dset, None)
+    engine.train(cfg['train'])
     

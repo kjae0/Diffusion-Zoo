@@ -7,7 +7,20 @@
 *.pz
 *.pkl
 *.zip
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.mp4
+*.avi
+*.wav
+*.mp3
+*.flac
+*.log
+*.json
+*.gif
 
 /data/*
 /ckpts/*
 /__pycache__/*
+/out_logs/*

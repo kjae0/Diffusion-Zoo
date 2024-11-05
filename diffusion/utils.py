@@ -2,12 +2,6 @@ import math
 import torch
 import torch.nn as nn
 
-#  def predict_start_from_noise(self, x_t, t, noise):
-#         return (
-#             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
-#             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
-#         )
-
 def remove_module_from_state_dict(state_dict):
     new_state_dict = {}
     for key, value in state_dict.items():
